@@ -10,29 +10,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// User 用户模型
-type User struct {
-	ID     uint   `gorm:"primarykey;column:id"`
-	UserID int64  `gorm:"column:user_id;not null"`
-	Name   string `gorm:"column:name"`
-}
-
-// Order 订单模型
-type Order struct {
-	ID      uint    `gorm:"primarykey;column:id"`
-	UserID  int64   `gorm:"column:user_id;not null"`
-	OrderID int64   `gorm:"column:order_id;not null"`
-	Amount  float64 `gorm:"column:amount"`
-}
-
-// Payment 支付模型
-type Payment struct {
-	ID      uint    `gorm:"primarykey;column:id"`
-	OrderID int64   `gorm:"column:order_id;not null"`
-	Amount  float64 `gorm:"column:amount"`
-	Status  string  `gorm:"column:status"`
-}
-
 // UserOrderPayment 连接查询结果
 type UserOrderPayment struct {
 	UserName string  `gorm:"column:user_name"`
@@ -55,9 +32,15 @@ func main() {
 	paymentStrategy := sharding.NewHashShardingStrategy("payments", "OrderID", 4)
 
 	// 注册分表策略
-	sharding.RegisterSharding(db, userStrategy)
-	sharding.RegisterSharding(db, orderStrategy)
-	sharding.RegisterSharding(db, paymentStrategy)
+	if err := sharding.RegisterSharding(db, userStrategy); err != nil {
+		log.Fatalf("Failed to register user sharding: %v", err)
+	}
+	if err := sharding.RegisterSharding(db, orderStrategy); err != nil {
+		log.Fatalf("Failed to register order sharding: %v", err)
+	}
+	if err := sharding.RegisterSharding(db, paymentStrategy); err != nil {
+		log.Fatalf("Failed to register payment sharding: %v", err)
+	}
 
 	// 示例 1: 三表连接查询（用户-订单-支付）
 	fmt.Println("=== 三表连接查询示例 ===")

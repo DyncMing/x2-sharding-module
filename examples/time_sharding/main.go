@@ -5,19 +5,12 @@ import (
 	"log"
 	"time"
 
+	"x2-sharding-module/examples/internal/models"
 	"x2-sharding-module/sharding"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
-
-// Log 日志模型（基于 created_at 进行时间分表）
-type Log struct {
-	ID        uint      `gorm:"primarykey"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
-	Message   string    `gorm:"column:message"`
-	Level     string    `gorm:"column:level"`
-}
 
 func main() {
 	// 连接数据库
@@ -36,7 +29,7 @@ func main() {
 	}
 
 	// 创建日志（自动路由到对应月份的表）
-	log1 := &Log{
+	log1 := &models.Log{
 		CreatedAt: time.Now(),
 		Message:   "Test log message",
 		Level:     "INFO",
@@ -55,7 +48,7 @@ func main() {
 	fmt.Printf("Tables in range: %v\n", tableNames)
 
 	// 跨表查询最近一个月的日志
-	var recentLogs []Log
+	var recentLogs []models.Log
 	err = sharding.CrossTableQuery(db, timeStrategy, &recentLogs, func(tx *gorm.DB) *gorm.DB {
 		return tx.Where("level = ?", "INFO").Order("created_at DESC")
 	})

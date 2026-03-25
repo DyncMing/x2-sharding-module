@@ -5,9 +5,9 @@ import (
 	"log"
 	"time"
 
-	"x2-sharding-module/sharding"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"x2-sharding-module/sharding"
 )
 
 // LogWithTime 使用 time.Time 类型的日志模型
@@ -49,7 +49,7 @@ func main() {
 	fmt.Println("=== 示例 1: time.Time 类型的时间分表 ===")
 	// 使用默认的自动识别类型（会识别为 time.Time）
 	timeStrategy1 := sharding.NewTimeShardingStrategy("logs_time", "CreatedAt", sharding.TimeShardingByMonth)
-	
+
 	// 或者明确指定类型
 	timeStrategy1 = sharding.NewTimeShardingStrategyWithType(
 		"logs_time",
@@ -134,7 +134,7 @@ func main() {
 
 	fmt.Println("\n=== 示例 5: 跨表查询（使用时间戳范围）===")
 	var logs []LogWithTimestamp
-	
+
 	// 使用时间戳范围查询
 	startTimestamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 	endTimestamp := time.Date(2024, 1, 31, 23, 59, 59, 0, time.UTC).Unix()
@@ -158,7 +158,7 @@ func main() {
 
 	fmt.Println("\n=== 示例 6: 跨表查询（使用日期字符串范围）===")
 	var dateLogs []LogWithDate
-	
+
 	// 使用日期字符串范围查询
 	err = sharding.CrossTableQueryWithTimeRange(
 		db,
@@ -184,8 +184,8 @@ func main() {
 
 	tableNames := timestampStrategy.GetAllTableNamesInRangeWithValues(
 		"logs_timestamp",
-		startTime,        // time.Time
-		endTimestamp2,    // int64 时间戳
+		startTime,     // time.Time
+		endTimestamp2, // int64 时间戳
 	)
 
 	fmt.Printf("Tables in range: %v\n", tableNames)
@@ -200,13 +200,13 @@ func main() {
 
 	// 测试不同的输入类型
 	testValues := []interface{}{
-		time.Now(),                    // time.Time
-		time.Now().Unix(),            // int64 (秒)
-		time.Now().UnixMilli(),       // int64 (毫秒)
-		"2024-01-15",                 // 日期字符串
-		"2024-01-15 12:00:00",       // 日期时间字符串
-		int32(time.Now().Unix()),     // int32 时间戳
-		uint64(time.Now().Unix()),    // uint64 时间戳
+		time.Now(),                // time.Time
+		time.Now().Unix(),         // int64 (秒)
+		time.Now().UnixMilli(),    // int64 (毫秒)
+		"2024-01-15",              // 日期字符串
+		"2024-01-15 12:00:00",     // 日期时间字符串
+		int32(time.Now().Unix()),  // int32 时间戳
+		uint64(time.Now().Unix()), // uint64 时间戳
 	}
 
 	fmt.Println("Auto-detection test results:")
@@ -215,4 +215,3 @@ func main() {
 		fmt.Printf("  Value %v -> Table: %s\n", val, tableName)
 	}
 }
-

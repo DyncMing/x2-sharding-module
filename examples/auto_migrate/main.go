@@ -5,27 +5,12 @@ import (
 	"log"
 	"time"
 
+	"x2-sharding-module/examples/internal/models"
 	"x2-sharding-module/sharding"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
-
-// User 用户模型
-type User struct {
-	ID     uint   `gorm:"primarykey"`
-	UserID int64  `gorm:"column:user_id;not null;index"`
-	Name   string `gorm:"column:name"`
-	Email  string `gorm:"column:email"`
-}
-
-// Log 日志模型
-type Log struct {
-	ID        uint      `gorm:"primarykey"`
-	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
-	Message   string    `gorm:"column:message"`
-	Level     string    `gorm:"column:level"`
-}
 
 func main() {
 	// 连接数据库
@@ -40,7 +25,7 @@ func main() {
 	hashStrategy := sharding.NewHashShardingStrategy("users", "UserID", 4)
 
 	// 方式 1: 使用 AutoMigrate 自动创建所有分表
-	err = sharding.AutoMigrate(db, hashStrategy, &User{}, sharding.AutoMigrateOptions{
+	err = sharding.AutoMigrate(db, hashStrategy, &models.UserWithEmail{}, sharding.AutoMigrateOptions{
 		SkipIfExists: true, // 如果表已存在则跳过
 	})
 	if err != nil {
@@ -71,7 +56,7 @@ func main() {
 	startTime := time.Now().AddDate(0, -3, 0)
 	endTime := time.Now()
 
-	err = sharding.AutoMigrate(db, timeStrategy, &Log{}, sharding.AutoMigrateOptions{
+	err = sharding.AutoMigrate(db, timeStrategy, &models.Log{}, sharding.AutoMigrateOptions{
 		SkipIfExists: true,
 		TimeRange: &sharding.AutoMigrateTimeRange{
 			StartTime: startTime,
@@ -87,13 +72,13 @@ func main() {
 
 	fmt.Println("\n=== 示例 3: 插入数据时自动创建表 ===")
 	// 注册分表策略并启用自动创建表功能
-	err = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
+	err = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &models.UserWithEmail{})
 	if err != nil {
 		log.Printf("Register sharding error: %v\n", err)
 	}
 
 	// 插入数据时，如果表不存在会自动创建
-	user := &User{
+	user := &models.UserWithEmail{
 		UserID: 123,
 		Name:   "John",
 		Email:  "john@example.com",
@@ -103,7 +88,7 @@ func main() {
 	fmt.Printf("User will be inserted into table: %s\n", tableName)
 
 	// 确保表存在
-	err = sharding.EnsureTableExists(db, hashStrategy, 123, &User{})
+	err = sharding.EnsureTableExists(db, hashStrategy, 123, &models.UserWithEmail{})
 	if err != nil {
 		log.Printf("Ensure table exists error: %v\n", err)
 	}
@@ -117,13 +102,13 @@ func main() {
 
 	fmt.Println("\n=== 示例 4: 时间分表自动创建（按需）===")
 	// 注册时间分表策略并启用自动创建
-	err = sharding.RegisterShardingWithAutoCreate(db, timeStrategy, &Log{})
+	err = sharding.RegisterShardingWithAutoCreate(db, timeStrategy, &models.Log{})
 	if err != nil {
 		log.Printf("Register time sharding error: %v\n", err)
 	}
 
 	// 插入日志时，如果对应的月份表不存在会自动创建
-	log1 := &Log{
+	log1 := &models.Log{
 		CreatedAt: time.Now(),
 		Message:   "Test log",
 		Level:     "INFO",
@@ -133,7 +118,7 @@ func main() {
 	fmt.Printf("Log will be inserted into table: %s\n", tableName)
 
 	// 确保表存在
-	err = sharding.EnsureTableExists(db, timeStrategy, log1.CreatedAt, &Log{})
+	err = sharding.EnsureTableExists(db, timeStrategy, log1.CreatedAt, &models.Log{})
 	if err != nil {
 		log.Printf("Ensure table exists error: %v\n", err)
 	}
@@ -151,13 +136,13 @@ func main() {
 		timeStrategy,
 	}
 
-	models := map[string]interface{}{
-		"users": &User{},
-		"logs":  &Log{},
+	exampleModels := map[string]interface{}{
+		"users": &models.UserWithEmail{},
+		"logs":  &models.Log{},
 	}
 
 	// 批量自动迁移
-	err = sharding.AutoMigrateAll(db, strategies, models, sharding.AutoMigrateOptions{
+	err = sharding.AutoMigrateAll(db, strategies, exampleModels, sharding.AutoMigrateOptions{
 		SkipIfExists: true,
 	})
 	if err != nil {
@@ -169,11 +154,7 @@ func main() {
 	fmt.Println("\n=== 示例 6: 范围分表自动创建 ===")
 	rangeStrategy := sharding.NewRangeShardingStrategy("products", "ProductID", 10000, 5)
 
-	err = sharding.AutoMigrate(db, rangeStrategy, &struct {
-		ID        uint   `gorm:"primarykey"`
-		ProductID int64  `gorm:"column:product_id;not null;index"`
-		Name      string `gorm:"column:name"`
-	}{}, sharding.AutoMigrateOptions{
+	err = sharding.AutoMigrate(db, rangeStrategy, &models.RangeProduct{}, sharding.AutoMigrateOptions{
 		SkipIfExists: true,
 	})
 	if err != nil {
@@ -185,11 +166,7 @@ func main() {
 	fmt.Println("\n=== 示例 7: 取模分表自动创建 ===")
 	moduloStrategy := sharding.NewModuloShardingStrategy("orders", "OrderID", 4)
 
-	err = sharding.AutoMigrate(db, moduloStrategy, &struct {
-		ID      uint   `gorm:"primarykey"`
-		OrderID int64  `gorm:"column:order_id;not null;index"`
-		Amount  string `gorm:"column:amount"`
-	}{}, sharding.AutoMigrateOptions{
+	err = sharding.AutoMigrate(db, moduloStrategy, &models.ModuloOrder{}, sharding.AutoMigrateOptions{
 		SkipIfExists: true,
 	})
 	if err != nil {

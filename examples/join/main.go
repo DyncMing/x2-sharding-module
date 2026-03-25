@@ -3,28 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"time"
 
-	"x2-sharding-module/sharding"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"x2-sharding-module/sharding"
 )
-
-// User 用户模型
-type User struct {
-	ID     uint   `gorm:"primarykey;column:id"`
-	UserID int64  `gorm:"column:user_id;not null"`
-	Name   string `gorm:"column:name"`
-}
-
-// Order 订单模型
-type Order struct {
-	ID      uint      `gorm:"primarykey;column:id"`
-	UserID  int64     `gorm:"column:user_id;not null"`
-	Amount  float64   `gorm:"column:amount"`
-	Status  string    `gorm:"column:status"`
-	CreatedAt time.Time `gorm:"column:created_at"`
-}
 
 func main() {
 	// 连接数据库
@@ -37,10 +20,14 @@ func main() {
 	// 创建基于 Hash 的分表策略
 	userStrategy := sharding.NewHashShardingStrategy("users", "UserID", 4)
 	orderStrategy := sharding.NewHashShardingStrategy("orders", "UserID", 4)
-	
+
 	// 注册分表策略
-	sharding.RegisterSharding(db, userStrategy)
-	sharding.RegisterSharding(db, orderStrategy)
+	if err := sharding.RegisterSharding(db, userStrategy); err != nil {
+		log.Fatalf("Failed to register user sharding: %v", err)
+	}
+	if err := sharding.RegisterSharding(db, orderStrategy); err != nil {
+		log.Fatalf("Failed to register order sharding: %v", err)
+	}
 
 	// 演示跨表连接查询
 	// 注意：由于两个表都是基于 UserID 分表的，所以 users_0 应该只连接 orders_0
@@ -60,7 +47,7 @@ func main() {
 	}
 
 	var results []UserOrder
-	
+
 	// 直接使用 GORM 的 Join（同一分表内）
 	err = db.Table(userTable).
 		Select("users.user_id, users.name, orders.id as order_id, orders.amount, orders.status").
@@ -73,7 +60,7 @@ func main() {
 	} else {
 		fmt.Printf("Found %d user-order pairs\n", len(results))
 		for _, result := range results {
-			fmt.Printf("User: %s, Order: %d, Amount: %.2f\n", 
+			fmt.Printf("User: %s, Order: %d, Amount: %.2f\n",
 				result.UserName, result.OrderID, result.Amount)
 		}
 	}
@@ -100,4 +87,3 @@ func main() {
 		fmt.Printf("Cross table join found %d results\n", len(allResults))
 	}
 }
-

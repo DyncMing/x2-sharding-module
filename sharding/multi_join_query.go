@@ -24,9 +24,9 @@ type TimeRange struct {
 
 // MultiJoinConfig 多表连接配置
 type MultiJoinConfig struct {
-	MainTable  JoinInfo              // 主表
-	JoinTables []JoinInfo            // 需要连接的表列表
-	TimeRanges map[string]TimeRange  // 时间分表的时间范围（可选）
+	MainTable  JoinInfo             // 主表
+	JoinTables []JoinInfo           // 需要连接的表列表
+	TimeRanges map[string]TimeRange // 时间分表的时间范围（可选）
 	// DeduplicateFields 去重字段配置（可选）
 	// 如果不设置，将使用默认的去重字段配置
 	// 字段组合按优先级顺序，从最精确到最通用
@@ -37,15 +37,17 @@ type MultiJoinConfig struct {
 // GetDefaultDeduplicateFields 获取默认的去重字段配置
 func GetDefaultDeduplicateFields() [][]string {
 	return [][]string{
-		{"id"},                                    // 单一主键
-		{"user_id", "order_id", "payment_id"},     // 用户、订单、支付组合（最完整）
-		{"user_id", "order_id"},                   // 用户和订单组合
-		{"order_id", "payment_id"},                // 订单和支付组合
-		{"user_id"},                               // 单一用户ID
-		{"order_id"},                              // 单一订单ID
-		{"payment_id"},                            // 单一支付ID
-		{"log_id"},                                // 日志ID
-		{"product_id"},                            // 商品ID
+		{"id"},                                // 单一主键
+		{"user_id", "order_id", "payment_id"}, // 用户、订单、支付组合（最完整）
+		{"log_id", "event_id"},                // 日志、事件组合
+		{"user_id", "order_id"},               // 用户和订单组合
+		{"order_id", "payment_id"},            // 订单和支付组合
+		{"user_id"},                           // 单一用户ID
+		{"order_id"},                          // 单一订单ID
+		{"payment_id"},                        // 单一支付ID
+		{"log_id"},                            // 日志ID
+		{"event_id"},                          // 事件ID
+		{"product_id"},                        // 商品ID
 	}
 }
 
@@ -90,7 +92,7 @@ func CrossTableMultiJoin(
 
 	for _, combination := range tableCombinations {
 		mainTableName := combination[0]
-		
+
 		// 为主表设置别名（使用基础表名作为别名，这样在 WHERE 条件中可以使用 users.user_id）
 		query := db.Table(fmt.Sprintf("%s AS %s", mainTableName, mainAlias))
 
@@ -102,8 +104,8 @@ func CrossTableMultiJoin(
 
 			// 替换 ON 条件中的基础表名为别名
 			onCondition := replaceTableNamesInCondition(
-				joinInfo.OnCondition, 
-				mainBaseName, mainAlias, 
+				joinInfo.OnCondition,
+				mainBaseName, mainAlias,
 				joinInfo.Strategy.GetBaseTableName(), joinAlias,
 			)
 
@@ -253,7 +255,7 @@ func CrossTableMultiJoinOptimized(
 	// 添加 JOIN
 	for i, joinInfo := range config.JoinTables {
 		joinAlias := joinAliases[i]
-		
+
 		// 替换 ON 条件中的表名
 		onCondition := replaceTableNamesInCondition(
 			joinInfo.OnCondition,
@@ -276,6 +278,14 @@ func CrossTableMultiJoinOptimized(
 
 // getTableNameByKey 根据连接键值获取表名
 func getTableNameByKey(strategy ShardingStrategy, baseTableName string, joinKeys map[string]interface{}) string {
+	if len(joinKeys) == 0 {
+		return baseTableName
+	}
+
+	if shardingValue, ok := findShardingValueForStrategy(strategy, joinKeys); ok {
+		return strategy.GetTableName(baseTableName, shardingValue)
+	}
+
 	// 尝试从 joinKeys 中提取分表键值
 	// 遍历所有可能的键值，使用第一个非空值
 	for _, value := range joinKeys {
@@ -288,20 +298,67 @@ func getTableNameByKey(strategy ShardingStrategy, baseTableName string, joinKeys
 	return baseTableName
 }
 
+func findShardingValueForStrategy(strategy ShardingStrategy, joinKeys map[string]interface{}) (interface{}, bool) {
+	switch s := strategy.(type) {
+	case *HashShardingStrategy:
+		return lookupJoinKeyValue(joinKeys, s.shardingKey)
+	case *TimeShardingStrategy:
+		return lookupJoinKeyValue(joinKeys, s.timeField)
+	default:
+		return nil, false
+	}
+}
+
+func lookupJoinKeyValue(joinKeys map[string]interface{}, expectedKey string) (interface{}, bool) {
+	if expectedKey == "" {
+		return nil, false
+	}
+
+	if value, ok := joinKeys[expectedKey]; ok && value != nil {
+		return value, true
+	}
+
+	normalizedExpectedKey := normalizeJoinKeyName(expectedKey)
+	for key, value := range joinKeys {
+		if value == nil {
+			continue
+		}
+		if normalizeJoinKeyName(key) == normalizedExpectedKey {
+			return value, true
+		}
+	}
+
+	return nil, false
+}
+
+func normalizeJoinKeyName(key string) string {
+	var builder strings.Builder
+	for _, r := range key {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			builder.WriteRune(r + ('a' - 'A'))
+		}
+	}
+	return builder.String()
+}
+
 // replaceTableNamesInCondition 替换条件中的基础表名为别名
 func replaceTableNamesInCondition(condition string, mainBaseName, mainAlias, joinBaseName, joinAlias string) string {
 	result := condition
-	
+
 	// 替换主表名
 	if mainBaseName != mainAlias {
 		result = strings.ReplaceAll(result, mainBaseName+".", mainAlias+".")
 	}
-	
+
 	// 替换连接表名
 	if joinBaseName != joinAlias {
 		result = strings.ReplaceAll(result, joinBaseName+".", joinAlias+".")
 	}
-	
+
 	return result
 }
 
@@ -312,7 +369,7 @@ func generateResultKey(result map[string]interface{}, keyFieldGroups [][]string)
 	for _, fields := range keyFieldGroups {
 		keyParts := make([]string, 0, len(fields))
 		allFound := true
-		
+
 		for _, field := range fields {
 			if val, ok := result[field]; ok && val != nil {
 				strVal := fmt.Sprintf("%v", val)
@@ -327,12 +384,12 @@ func generateResultKey(result map[string]interface{}, keyFieldGroups [][]string)
 				break
 			}
 		}
-		
+
 		if allFound && len(keyParts) > 0 {
 			return strings.Join(keyParts, "|")
 		}
 	}
-	
+
 	// 如果没有找到常见唯一字段组合，使用所有非 nil 字段的组合
 	keyParts := make([]string, 0)
 	for k, v := range result {
@@ -343,13 +400,19 @@ func generateResultKey(result map[string]interface{}, keyFieldGroups [][]string)
 			}
 		}
 	}
-	
+
 	if len(keyParts) == 0 {
 		// 如果没有找到任何有效字段，使用空字符串（可能导致重复，但比崩溃好）
 		return ""
 	}
-	
+
 	return strings.Join(keyParts, "|")
+}
+
+type resultDedupMeta struct {
+	primaryKey    string
+	primaryFields []string
+	groupIndex    int
 }
 
 // deduplicateResults 对结果进行去重
@@ -358,18 +421,123 @@ func deduplicateResults(results []map[string]interface{}, keyFieldGroups [][]str
 	if len(results) == 0 {
 		return results
 	}
-	
+
+	metas := make([]resultDedupMeta, len(results))
+	for i, result := range results {
+		metas[i] = buildResultDedupMeta(result, keyFieldGroups)
+	}
+
 	seenKeys := make(map[string]bool)
 	deduplicated := make([]map[string]interface{}, 0, len(results))
-	
-	for _, result := range results {
-		key := generateResultKey(result, keyFieldGroups)
-		if !seenKeys[key] {
-			seenKeys[key] = true
-			deduplicated = append(deduplicated, result)
+
+	for i, result := range results {
+		meta := metas[i]
+		if meta.primaryKey == "" {
+			continue
 		}
+
+		if seenKeys[meta.primaryKey] {
+			continue
+		}
+
+		if isShadowedByMoreSpecificResult(i, results, metas) {
+			continue
+		}
+
+		seenKeys[meta.primaryKey] = true
+		deduplicated = append(deduplicated, result)
 	}
-	
+
 	return deduplicated
 }
 
+func buildResultDedupMeta(result map[string]interface{}, keyFieldGroups [][]string) resultDedupMeta {
+	for i, fields := range keyFieldGroups {
+		if key, ok := buildKeyFromFields(result, fields); ok {
+			return resultDedupMeta{
+				primaryKey:    key,
+				primaryFields: append([]string(nil), fields...),
+				groupIndex:    i,
+			}
+		}
+	}
+
+	fallbackFields := collectNonNilFields(result)
+	return resultDedupMeta{
+		primaryKey:    generateResultKey(result, keyFieldGroups),
+		primaryFields: fallbackFields,
+		groupIndex:    len(keyFieldGroups),
+	}
+}
+
+func buildKeyFromFields(result map[string]interface{}, fields []string) (string, bool) {
+	keyParts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		val, ok := result[field]
+		if !ok || val == nil {
+			return "", false
+		}
+
+		strVal := fmt.Sprintf("%v", val)
+		if strVal == "" || strVal == "<nil>" {
+			return "", false
+		}
+
+		keyParts = append(keyParts, fmt.Sprintf("%s:%v", field, val))
+	}
+
+	if len(keyParts) == 0 {
+		return "", false
+	}
+
+	return strings.Join(keyParts, "|"), true
+}
+
+func collectNonNilFields(result map[string]interface{}) []string {
+	fields := make([]string, 0, len(result))
+	for field, value := range result {
+		if value == nil {
+			continue
+		}
+		strVal := fmt.Sprintf("%v", value)
+		if strVal == "" || strVal == "<nil>" {
+			continue
+		}
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+func isShadowedByMoreSpecificResult(currentIndex int, results []map[string]interface{}, metas []resultDedupMeta) bool {
+	currentMeta := metas[currentIndex]
+	if len(currentMeta.primaryFields) == 0 {
+		return false
+	}
+
+	for i, otherMeta := range metas {
+		if i == currentIndex || otherMeta.groupIndex >= currentMeta.groupIndex {
+			continue
+		}
+
+		if matchesFields(results[i], results[currentIndex], currentMeta.primaryFields) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchesFields(left, right map[string]interface{}, fields []string) bool {
+	for _, field := range fields {
+		leftValue, leftOk := left[field]
+		rightValue, rightOk := right[field]
+		if !leftOk || !rightOk {
+			return false
+		}
+		if fmt.Sprintf("%v", leftValue) != fmt.Sprintf("%v", rightValue) {
+			return false
+		}
+	}
+
+	return true
+}

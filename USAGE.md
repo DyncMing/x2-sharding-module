@@ -367,6 +367,9 @@ err = sharding.CrossTableQueryWithTimeRange(
 
 ### 3. 跨表连接查询
 
+连接查询支持在同一个方法里混用不同的分表策略，例如：主表使用 Hash 分表、关联表使用 Time 分表。
+如果传入时间范围，只有时间分表的一侧会按时间范围裁剪，Hash 分表的一侧仍按其全部分表参与查询。
+
 #### 两个表的连接查询
 
 当需要连接两个分表时，可以使用 `CrossTableJoin` 函数：
@@ -388,6 +391,79 @@ orderStrategy := sharding.NewHashShardingStrategy("orders", "UserID", 4)
 				Where("users.user_id = ?", 123)
 		},
 	)
+```
+
+#### 两个表的连接分页
+
+当只连接两个 Hash 分表时，推荐直接使用 `CrossTableJoinPaginate`：
+
+```go
+userStrategy := sharding.NewHashShardingStrategy("users", "UserID", 4)
+orderStrategy := sharding.NewHashShardingStrategy("orders", "UserID", 4)
+
+type JoinPageRow struct {
+  UserID   int64  `gorm:"column:user_id"`
+  UserName string `gorm:"column:user_name"`
+  OrderID  int64  `gorm:"column:order_id"`
+}
+
+var pageResults []JoinPageRow
+
+paginator, err := sharding.CrossTableJoinPaginate(
+  db,
+  userStrategy,
+  orderStrategy,
+  sharding.LeftJoin,
+  "users.user_id = orders.user_id",
+  &pageResults,
+  1,  // 页码
+  20, // 每页数量
+  func(tx *gorm.DB) *gorm.DB {
+    return tx.
+      Select("users.user_id, users.name AS user_name, orders.order_id").
+      Where("users.user_id > ?", 0).
+      Order("users.user_id ASC")
+  },
+)
+
+fmt.Printf("Page=%d Total=%d TotalPages=%d\n", paginator.Page, paginator.Total, paginator.TotalPages)
+```
+
+#### 支持时间范围的两表连接分页（可用于 Time+Time 或 Hash+Time）
+
+当连接两个时间分表，或者主表是 Hash 分表、关联表是 Time 分表时，都可以使用 `CrossTableJoinPaginateWithTimeRange` 并直接传入时间范围：
+
+```go
+logStrategy := sharding.NewTimeShardingStrategy("logs", "CreatedAt", sharding.TimeShardingByMonth)
+eventStrategy := sharding.NewTimeShardingStrategy("events", "CreatedAt", sharding.TimeShardingByMonth)
+
+type LogEventRow struct {
+  LogID     int64  `gorm:"column:log_id"`
+  EventID   int64  `gorm:"column:event_id"`
+  EventName string `gorm:"column:event_name"`
+}
+
+var timePageResults []LogEventRow
+
+paginator, err := sharding.CrossTableJoinPaginateWithTimeRange(
+  db,
+  logStrategy,
+  eventStrategy,
+  sharding.LeftJoin,
+  "logs.log_id = events.log_id",
+  &timePageResults,
+  1,
+  20,
+  func(tx *gorm.DB) *gorm.DB {
+    return tx.
+      Select("logs.log_id, events.event_id, events.name AS event_name").
+      Order("logs.log_id ASC")
+  },
+  time.Date(2026, 2, 28, 23, 59, 59, 0, time.UTC),
+  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), // 起止时间写反也会自动纠正
+)
+
+fmt.Printf("Range Total=%d Rows=%d\n", paginator.Total, len(timePageResults))
 ```
 
 #### 多表连接查询分页
@@ -441,10 +517,10 @@ optimizedPaginator, err := sharding.CrossTableMultiJoinPaginateOptimized(
 )
 ```
 
-#### Hash 分表的分页连接查询示例
+#### Hash 分表的分页连接查询示例（3 个及以上表）
 
 ```go
-// Hash 分表策略
+// 适用于 3 个及以上表的 Hash 分表连接分页
 userStrategy := sharding.NewHashShardingStrategy("users", "UserID", 4)
 orderStrategy := sharding.NewHashShardingStrategy("orders", "UserID", 4)
 paymentStrategy := sharding.NewHashShardingStrategy("payments", "OrderID", 4)
@@ -487,10 +563,10 @@ hashPaginator, err := sharding.CrossTableMultiJoinPaginate(
 )
 ```
 
-#### 时间分表的分页连接查询示例
+#### 时间分表的分页连接查询示例（3 个及以上表）
 
 ```go
-// 时间分表策略（按月分表）
+// 适用于 3 个及以上表的时间分表连接分页
 logStrategy := sharding.NewTimeShardingStrategy("logs", "CreatedAt", sharding.TimeShardingByMonth)
 eventStrategy := sharding.NewTimeShardingStrategy("events", "CreatedAt", sharding.TimeShardingByMonth)
 
@@ -539,8 +615,8 @@ timePaginator, err := sharding.CrossTableMultiJoinPaginate(
 1. **表别名**：系统会自动为所有表设置别名，别名就是基础表名。在 `queryBuilder` 中应使用别名（如 `users.user_id`）而不是实际分表名（如 `users_0.user_id`）。
 
 2. **自动去重**：
-   - 多表连接查询会自动对结果进行去重，避免因表组合产生的重复数据
-   - **计数函数也会自动去重**，确保 `CrossTableMultiJoinCount` 返回的数量与查询结果一致
+   - 两表连接分页和多表连接查询都会自动对结果进行去重，避免因表组合产生的重复数据
+   - **计数函数也会自动去重**，确保 `CrossTableJoinCount` / `CrossTableMultiJoinCount` 返回的数量与查询结果一致
    - 去重逻辑会智能识别唯一字段组合（如 user_id + order_id + payment_id）
 
 3. **自定义去重字段**：可以配置 `DeduplicateFields` 来自定义去重逻辑：
@@ -735,11 +811,14 @@ moduloStrategy := sharding.NewModuloShardingStrategy("products", "ProductID", 4)
 
 ## 示例代码
 
-完整示例请参考 `examples/` 目录：
+完整示例请参考 `examples/README.md`：
 
-- `hash_sharding_example.go` - Hash 分表示例
-- `time_sharding_example.go` - 时间分表示例
-- `join_example.go` - 跨表连接查询示例
+- `hash_sharding/main.go` - Hash 分表示例
+- `time_sharding/main.go` - 时间分表示例
+- `join/main.go` - 跨表连接查询示例
+- `join_pagination/main.go` - Hash + Time 混合连接分页示例
+- `multi_join_pagination/main.go` - 多表连接分页示例
+- `internal/models/models.go` - 示例共享模型定义
 
 ## 注意事项
 

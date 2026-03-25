@@ -6,41 +6,19 @@ import (
 	"time"
 
 	"x2-sharding-module/sharding"
+
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
-// User 用户模型
-type User struct {
-	ID     uint   `gorm:"primarykey;column:id"`
-	UserID int64  `gorm:"column:user_id;not null"`
-	Name   string `gorm:"column:name"`
-}
-
-// Order 订单模型
-type Order struct {
-	ID      uint    `gorm:"primarykey;column:id"`
-	UserID  int64   `gorm:"column:user_id;not null"`
-	OrderID int64   `gorm:"column:order_id;not null"`
-	Amount  float64 `gorm:"column:amount"`
-}
-
-// Payment 支付模型
-type Payment struct {
-	ID      uint    `gorm:"primarykey;column:id"`
-	OrderID int64   `gorm:"column:order_id;not null"`
-	Amount  float64 `gorm:"column:amount"`
-	Status  string  `gorm:"column:status"`
-}
-
 // UserOrderPaymentResult 查询结果
 type UserOrderPaymentResult struct {
-	UserID    int64   `gorm:"column:user_id"`
-	UserName  string  `gorm:"column:user_name"`
-	OrderID   int64   `gorm:"column:order_id"`
-	OrderAmount float64 `gorm:"column:order_amount"`
+	UserID        int64   `gorm:"column:user_id"`
+	UserName      string  `gorm:"column:user_name"`
+	OrderID       int64   `gorm:"column:order_id"`
+	OrderAmount   float64 `gorm:"column:order_amount"`
 	PaymentAmount float64 `gorm:"column:payment_amount"`
-	Status    string  `gorm:"column:payment_status"`
+	Status        string  `gorm:"column:payment_status"`
 }
 
 func main() {
@@ -57,12 +35,18 @@ func main() {
 	paymentStrategy := sharding.NewHashShardingStrategy("payments", "OrderID", 4)
 
 	// 注册分表策略
-	sharding.RegisterSharding(db, userStrategy)
-	sharding.RegisterSharding(db, orderStrategy)
-	sharding.RegisterSharding(db, paymentStrategy)
+	if err := sharding.RegisterSharding(db, userStrategy); err != nil {
+		log.Fatalf("Failed to register user sharding: %v", err)
+	}
+	if err := sharding.RegisterSharding(db, orderStrategy); err != nil {
+		log.Fatalf("Failed to register order sharding: %v", err)
+	}
+	if err := sharding.RegisterSharding(db, paymentStrategy); err != nil {
+		log.Fatalf("Failed to register payment sharding: %v", err)
+	}
 
 	fmt.Println("=== 示例 1: 三表连接查询分页 ===")
-	
+
 	// 配置三表连接
 	config := sharding.MultiJoinConfig{
 		MainTable: sharding.JoinInfo{
@@ -85,7 +69,7 @@ func main() {
 	}
 
 	var results []map[string]interface{}
-	
+
 	// 执行分页查询
 	// 注意：在 queryBuilder 中应该使用表别名（基础表名），如 users.user_id
 	// 因为我们已经为表设置了别名，别名就是基础表名
@@ -93,8 +77,8 @@ func main() {
 		db,
 		config,
 		&results,
-		1,      // 第1页
-		10,     // 每页10条
+		1,  // 第1页
+		10, // 每页10条
 		func(tx *gorm.DB) *gorm.DB {
 			return tx.Select("users.user_id, users.name as user_name, orders.order_id, orders.amount as order_amount, payments.amount as payment_amount, payments.status as payment_status").
 				Where("users.user_id > ?", 0).
@@ -111,7 +95,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== 示例 2: 优化的多表连接分页（已知连接键）===")
-	
+
 	// 如果已知连接键值，可以使用优化版本
 	joinKeys := map[string]interface{}{
 		"user_id":  123,
@@ -119,7 +103,7 @@ func main() {
 	}
 
 	var optimizedResults []UserOrderPaymentResult
-	
+
 	optimizedPaginator, err := sharding.CrossTableMultiJoinPaginateOptimized(
 		db,
 		config,
@@ -146,7 +130,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== 示例 3: 多表连接查询计数 ===")
-	
+
 	totalCount, err := sharding.CrossTableMultiJoinCount(
 		db,
 		config,
@@ -162,7 +146,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== 示例 4: 时间分表的多表连接分页查询 ===")
-	
+
 	// 创建时间分表策略
 	logStrategy := sharding.NewTimeShardingStrategy("logs", "CreatedAt", sharding.TimeShardingByMonth)
 	eventStrategy := sharding.NewTimeShardingStrategy("events", "CreatedAt", sharding.TimeShardingByMonth)
@@ -187,7 +171,7 @@ func main() {
 	endTime := time.Now()
 
 	var timeResults []map[string]interface{}
-	
+
 	timePaginator, err := sharding.CrossTableMultiJoinPaginateWithTimeRange(
 		db,
 		timeConfig,
@@ -210,7 +194,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== 示例 5: 使用时间戳进行多表连接分页 ===")
-	
+
 	// 使用时间戳作为时间范围
 	startTimestamp := time.Now().AddDate(0, -1, 0).Unix() // 1个月前的时间戳
 	endTimestamp := time.Now().Unix()
@@ -233,4 +217,3 @@ func main() {
 
 	fmt.Println("\n所有示例执行完成！")
 }
-

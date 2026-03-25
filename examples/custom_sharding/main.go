@@ -5,19 +5,12 @@ import (
 	"log"
 	"strings"
 
+	"x2-sharding-module/examples/internal/models"
 	"x2-sharding-module/sharding"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
-
-// Product 商品模型（使用自定义分表策略）
-type Product struct {
-	ID        uint   `gorm:"primarykey;column:id"`
-	ProductID int64  `gorm:"column:product_id;not null"`
-	Name      string `gorm:"column:name"`
-	Category  string `gorm:"column:category"`
-}
 
 func main() {
 	// 连接数据库
@@ -69,23 +62,29 @@ func main() {
 		getAllTablesFunc,
 	)
 
-	sharding.RegisterSharding(db, categoryStrategy)
+	if err := sharding.RegisterSharding(db, categoryStrategy); err != nil {
+		log.Fatalf("Failed to register custom sharding: %v", err)
+	}
 
 	// 插入数据
-	product1 := &Product{ProductID: 1, Name: "Apple iPhone", Category: "Electronics"}
+	product1 := &models.Product{ProductID: 1, Name: "Apple iPhone", Category: "Electronics"}
 	tableName := categoryStrategy.GetTableName("products", "Electronics")
 	fmt.Printf("Product with category 'Electronics' will be in table: %s\n", tableName)
 
-	db.Table(tableName).Create(product1)
+	if err := db.Table(tableName).Create(product1).Error; err != nil {
+		log.Printf("Create product error: %v\n", err)
+	}
 
-	product2 := &Product{ProductID: 2, Name: "Nike Shoes", Category: "Sports"}
+	product2 := &models.Product{ProductID: 2, Name: "Nike Shoes", Category: "Sports"}
 	tableName = categoryStrategy.GetTableName("products", "Sports")
 	fmt.Printf("Product with category 'Sports' will be in table: %s\n", tableName)
 
-	db.Table(tableName).Create(product2)
+	if err := db.Table(tableName).Create(product2).Error; err != nil {
+		log.Printf("Create product error: %v\n", err)
+	}
 
 	// 跨表查询
-	var allProducts []Product
+	var allProducts []models.Product
 	err = sharding.CrossTableQuery(db, categoryStrategy, &allProducts, func(tx *gorm.DB) *gorm.DB {
 		return tx.Where("name LIKE ?", "%iPhone%")
 	})

@@ -133,6 +133,68 @@ sharding.CrossTableJoin(
 )
 ```
 
+#### 两个分表的连接分页（Hash 分表）
+
+```go
+userStrategy := sharding.NewHashShardingStrategy("users", "UserID", 4)
+orderStrategy := sharding.NewHashShardingStrategy("orders", "UserID", 4)
+
+type JoinPageRow struct {
+    UserID   int64  `gorm:"column:user_id"`
+    UserName string `gorm:"column:user_name"`
+    OrderID  int64  `gorm:"column:order_id"`
+}
+
+var rows []JoinPageRow
+paginator, _ := sharding.CrossTableJoinPaginate(
+    db,
+    userStrategy,
+    orderStrategy,
+    sharding.LeftJoin,
+    "users.user_id = orders.user_id",
+    &rows,
+    1,
+    10,
+    func(tx *gorm.DB) *gorm.DB {
+        return tx.
+            Select("users.user_id, users.name AS user_name, orders.order_id").
+            Order("users.user_id ASC")
+    },
+)
+fmt.Printf("Total: %d, Pages: %d\n", paginator.Total, paginator.TotalPages)
+```
+
+#### 支持时间范围的两表连接分页（可用于 Time+Time 或 Hash+Time）
+
+```go
+logStrategy := sharding.NewTimeShardingStrategy("logs", "CreatedAt", sharding.TimeShardingByMonth)
+eventStrategy := sharding.NewTimeShardingStrategy("events", "CreatedAt", sharding.TimeShardingByMonth)
+
+type LogEventRow struct {
+    LogID     int64  `gorm:"column:log_id"`
+    EventID   int64  `gorm:"column:event_id"`
+    EventName string `gorm:"column:event_name"`
+}
+
+var rows []LogEventRow
+paginator, _ := sharding.CrossTableJoinPaginateWithTimeRange(
+    db,
+    logStrategy,
+    eventStrategy,
+    sharding.LeftJoin,
+    "logs.log_id = events.log_id",
+    &rows,
+    1,
+    20,
+    func(tx *gorm.DB) *gorm.DB {
+        return tx.Select("logs.log_id, events.event_id, events.name AS event_name")
+    },
+    time.Date(2026, 3, 31, 23, 59, 59, 0, time.UTC),
+    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), // 起止时间写反也会自动纠正
+)
+fmt.Printf("Range Total: %d\n", paginator.Total)
+```
+
 #### 多表连接查询（3个及以上表）
 
 ```go
@@ -226,9 +288,11 @@ x2-sharding-module/
 │   ├── join_query.go        # 跨表连接查询
 │   └── helper.go            # 辅助工具函数
 ├── examples/          # 示例代码
-│   ├── hash_sharding_example.go
-│   ├── time_sharding_example.go
-│   └── join_example.go
+│   ├── internal/models/      # 示例共享模型
+│   ├── hash_sharding/main.go
+│   ├── time_sharding/main.go
+│   ├── join/main.go
+│   └── multi_join/main.go
 ├── go.mod
 ├── README.md
 └── USAGE.md          # 详细使用文档
@@ -237,7 +301,7 @@ x2-sharding-module/
 ## 详细文档
 
 - [使用指南 (USAGE.md)](USAGE.md) - 完整的使用说明和最佳实践
-- [示例代码](examples/) - 各种使用场景的示例
+- [示例索引 (examples/README.md)](examples/README.md) - 各种使用场景的示例入口与运行说明
 
 ## 核心 API
 
@@ -258,6 +322,22 @@ x2-sharding-module/
 ### 自动创建分表
 
 - `AutoMigrate(db, strategy, model, options)` - 自动创建所有分表
+
+### 连接查询与分页
+
+- `CrossTableJoin(...)` - 两个分表的连接查询
+- `CrossTableJoinCount(...)` - 两个分表的连接计数
+- `CrossTableJoinPaginate(...)` - 两个分表的连接分页（适用于 Hash 分表）
+- `CrossTableJoinWithTimeRange(...)` - 支持时间范围的两表连接查询（适用于时间分表或混合策略）
+- `CrossTableJoinCountWithTimeRange(...)` - 支持时间范围的两表连接计数（适用于时间分表或混合策略）
+- `CrossTableJoinPaginateWithTimeRange(...)` - 支持时间范围的两表连接分页（适用于时间分表或混合策略）
+- `CrossTableMultiJoin(...)` - 多表连接查询
+- `CrossTableMultiJoinCount(...)` - 多表连接计数
+- `CrossTableMultiJoinPaginate(...)` - 多表连接分页
+- `CrossTableMultiJoinOptimized(...)` - 基于连接键的多表优化连接查询
+- `CrossTableMultiJoinPaginateWithTimeRange(...)` - 多表时间分表连接分页
+- `CrossTableMultiJoinCountWithTimeRange(...)` - 多表时间分表连接计数
+- `CrossTableMultiJoinPaginateOptimized(...)` - 基于连接键的多表优化连接分页
 - `RegisterShardingWithAutoCreate(db, strategy, model)` - 注册策略并启用自动创建
 - `EnsureTableExists(db, strategy, shardingValue, model)` - 确保表存在
 - `AutoMigrateAll(db, strategies, models, options)` - 批量自动创建所有策略的分表
@@ -265,29 +345,22 @@ x2-sharding-module/
 ### 查询操作
 
 - `CrossTableQuery(db, strategy, dest, queryBuilder)` - 跨表查询
+- `CrossTableQueryWithTimeRange(db, strategy, dest, queryBuilder, startValue, endValue)` - 时间分表范围查询
 - `CrossTablePaginate(db, strategy, dest, page, pageSize, queryBuilder)` - 跨表分页
+- `CrossTableCountWithTimeRange(db, strategy, queryBuilder, startValue, endValue)` - 时间分表范围计数
+- `CrossTablePaginateWithTimeRange(db, strategy, dest, page, pageSize, queryBuilder, startValue, endValue)` - 时间分表范围分页
 - `CrossTableJoin(db, strategy1, strategy2, joinType, onCondition, dest, queryBuilder)` - 跨表连接
 - `CrossTableCount(db, strategy, queryBuilder)` - 跨表计数
 
 ### 多表连接查询
 
 - `CrossTableMultiJoin(db, config, dest, queryBuilder)` - 多表连接查询
-- `CrossTableMultiJoinCount(db, config, queryBuilder)` - 多表连接查询计数
-- `CrossTableMultiJoinPaginate(db, config, dest, page, pageSize, queryBuilder)` - 多表连接查询分页
-- `CrossTableMultiJoinPaginateOptimized(db, config, joinKeys, dest, page, pageSize, queryBuilder)` - 优化的多表连接查询分页
-
-### 辅助工具
-
-- `ShardingHelper` - 分表辅助工具类，简化常用操作
-- `GenerateTableNames()` - 生成所有分表的创建 SQL
-- `CreateAllHashTables()` - 批量创建 Hash 分表
 
 ## 注意事项
 
-1. **表结构一致性** - 所有分表必须具有相同的表结构
-2. **性能考虑** - 跨表查询会查询所有分表，大数据量时注意性能影响
-3. **表不存在** - 跨表查询时，不存在的表会被自动跳过
-4. **事务支持** - 支持事务，但跨表查询在事务中可能有限制
+1. **性能考虑** - 跨表查询会查询所有分表，大数据量时注意性能影响
+2. **表不存在** - 跨表查询时，不存在的表会被自动跳过
+3. **事务支持** - 支持事务，但跨表查询在事务中可能有限制
 
 ## 系统要求
 

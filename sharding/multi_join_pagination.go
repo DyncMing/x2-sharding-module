@@ -51,7 +51,7 @@ func CrossTableMultiJoinCount(
 
 	for _, combination := range tableCombinations {
 		mainTableName := combination[0]
-		
+
 		// 为主表设置别名
 		query := db.Table(fmt.Sprintf("%s AS %s", mainTableName, mainAlias))
 
@@ -171,7 +171,7 @@ func CrossTableMultiJoinPaginateOptimized(
 
 	// 获取主表的表名（分表名）
 	mainTableName := getTableNameByKey(config.MainTable.Strategy, mainBaseName, joinKeys)
-	
+
 	// 为主表设置别名（使用基础表名作为别名，这样在 WHERE 条件中可以使用 users.user_id）
 	query := db.Table(fmt.Sprintf("%s AS %s", mainTableName, mainAlias))
 
@@ -190,7 +190,7 @@ func CrossTableMultiJoinPaginateOptimized(
 	// 添加 JOIN
 	for i, joinInfo := range config.JoinTables {
 		joinAlias := joinAliases[i]
-		
+
 		// 替换 ON 条件中的基础表名为别名
 		onCondition := replaceTableNamesInCondition(
 			joinInfo.OnCondition,
@@ -245,49 +245,7 @@ func CrossTableMultiJoinCountWithTimeRange(
 	queryBuilder QueryBuilder,
 	startValue, endValue interface{}, // 时间范围值（支持多种类型）
 ) (int64, error) {
-	// 如果是时间分表，需要更新 TimeRanges
-	if startValue != nil && endValue != nil {
-		// 更新配置中的时间范围
-		if config.TimeRanges == nil {
-			config.TimeRanges = make(map[string]TimeRange)
-		}
-
-		// 转换时间值
-		var startTime, endTime time.Time
-		
-		// 转换开始时间
-		if st, ok := startValue.(time.Time); ok {
-			startTime = st
-		} else {
-			// 尝试通过策略获取表名来推断时间
-			// 使用 GetTableName 方法间接获取时间
-			startTime = convertValueToTime(startValue)
-		}
-
-		// 转换结束时间
-		if et, ok := endValue.(time.Time); ok {
-			endTime = et
-		} else {
-			endTime = convertValueToTime(endValue)
-		}
-
-		// 为所有时间分表设置时间范围
-		baseTableName := config.MainTable.Strategy.GetBaseTableName()
-		config.TimeRanges[baseTableName] = TimeRange{
-			StartTime: startTime,
-			EndTime:   endTime,
-		}
-
-		for _, joinInfo := range config.JoinTables {
-			if _, ok := joinInfo.Strategy.(*TimeShardingStrategy); ok {
-				joinBaseName := joinInfo.Strategy.GetBaseTableName()
-				config.TimeRanges[joinBaseName] = TimeRange{
-					StartTime: startTime,
-					EndTime:   endTime,
-				}
-			}
-		}
-	}
+	applyTimeRangeToMultiJoinConfig(&config, startValue, endValue)
 
 	return CrossTableMultiJoinCount(db, config, queryBuilder)
 }
@@ -301,48 +259,56 @@ func CrossTableMultiJoinPaginateWithTimeRange(
 	queryBuilder QueryBuilder,
 	startValue, endValue interface{}, // 时间范围值（支持多种类型）
 ) (*Paginator, error) {
-	// 如果是时间分表，需要更新 TimeRanges
-	if startValue != nil && endValue != nil {
-		if config.TimeRanges == nil {
-			config.TimeRanges = make(map[string]TimeRange)
-		}
+	applyTimeRangeToMultiJoinConfig(&config, startValue, endValue)
 
-		// 转换时间值
-		var startTime, endTime time.Time
-		
-		// 转换开始时间
-		if st, ok := startValue.(time.Time); ok {
-			startTime = st
-		} else {
-			startTime = convertValueToTime(startValue)
-		}
+	return CrossTableMultiJoinPaginate(db, config, dest, page, pageSize, queryBuilder)
+}
 
-		// 转换结束时间
-		if et, ok := endValue.(time.Time); ok {
-			endTime = et
-		} else {
-			endTime = convertValueToTime(endValue)
-		}
+func applyTimeRangeToMultiJoinConfig(config *MultiJoinConfig, startValue, endValue interface{}) {
+	if config == nil || startValue == nil || endValue == nil {
+		return
+	}
 
-		// 为所有时间分表设置时间范围
-		baseTableName := config.MainTable.Strategy.GetBaseTableName()
-		config.TimeRanges[baseTableName] = TimeRange{
-			StartTime: startTime,
-			EndTime:   endTime,
-		}
+	if config.TimeRanges == nil {
+		config.TimeRanges = make(map[string]TimeRange)
+	}
 
-		for _, joinInfo := range config.JoinTables {
-			if _, ok := joinInfo.Strategy.(*TimeShardingStrategy); ok {
-				joinBaseName := joinInfo.Strategy.GetBaseTableName()
-				config.TimeRanges[joinBaseName] = TimeRange{
-					StartTime: startTime,
-					EndTime:   endTime,
-				}
-			}
+	startTime, endTime := normalizeConvertedTimeRange(startValue, endValue)
+	if timeStrategy, ok := config.MainTable.Strategy.(*TimeShardingStrategy); ok {
+		if parsedStart, parsedEnd, err := timeStrategy.ParseTimeRange(startValue, endValue); err == nil {
+			startTime, endTime = parsedStart, parsedEnd
 		}
 	}
 
-	return CrossTableMultiJoinPaginate(db, config, dest, page, pageSize, queryBuilder)
+	baseTableName := config.MainTable.Strategy.GetBaseTableName()
+	config.TimeRanges[baseTableName] = TimeRange{
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+
+	for _, joinInfo := range config.JoinTables {
+		if timeStrategy, ok := joinInfo.Strategy.(*TimeShardingStrategy); ok {
+			joinStartTime, joinEndTime := startTime, endTime
+			if parsedStart, parsedEnd, err := timeStrategy.ParseTimeRange(startValue, endValue); err == nil {
+				joinStartTime, joinEndTime = parsedStart, parsedEnd
+			}
+
+			joinBaseName := joinInfo.Strategy.GetBaseTableName()
+			config.TimeRanges[joinBaseName] = TimeRange{
+				StartTime: joinStartTime,
+				EndTime:   joinEndTime,
+			}
+		}
+	}
+}
+
+func normalizeConvertedTimeRange(startValue, endValue interface{}) (time.Time, time.Time) {
+	startTime := convertValueToTime(startValue)
+	endTime := convertValueToTime(endValue)
+	if startTime.After(endTime) {
+		return endTime, startTime
+	}
+	return startTime, endTime
 }
 
 // convertValueToTime 将各种类型的时间值转换为 time.Time（辅助函数）
@@ -440,4 +406,3 @@ func parseStringTimeInMultiJoin(str string) time.Time {
 
 	return time.Now()
 }
-
