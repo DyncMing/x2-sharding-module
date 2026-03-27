@@ -10,14 +10,14 @@ import (
 
 // ShardingHelper 分表辅助工具
 type ShardingHelper struct {
-	db       *gorm.DB
+	db         *gorm.DB
 	strategies map[string]ShardingStrategy // 按基础表名缓存策略
 }
 
 // NewShardingHelper 创建分表辅助工具
 func NewShardingHelper(db *gorm.DB) *ShardingHelper {
 	return &ShardingHelper{
-		db:        db,
+		db:         db,
 		strategies: make(map[string]ShardingStrategy),
 	}
 }
@@ -27,6 +27,35 @@ func (h *ShardingHelper) RegisterStrategy(strategy ShardingStrategy) error {
 	baseTableName := strategy.GetBaseTableName()
 	h.strategies[baseTableName] = strategy
 	return RegisterSharding(h.db, strategy)
+}
+
+// RegisterStrategyWithOptions 使用统一选项注册分表策略。
+func (h *ShardingHelper) RegisterStrategyWithOptions(strategy ShardingStrategy, options RegisterShardingOptions) error {
+	baseTableName := strategy.GetBaseTableName()
+	h.strategies[baseTableName] = strategy
+	return RegisterShardingWithOptions(h.db, strategy, options)
+}
+
+// RegisterStrategyWithConfigFile 使用 JSON 配置文件注册分表策略。
+func (h *ShardingHelper) RegisterStrategyWithConfigFile(strategy ShardingStrategy, model interface{}, filePath string) error {
+	baseTableName := strategy.GetBaseTableName()
+	h.strategies[baseTableName] = strategy
+	return RegisterShardingWithConfigFile(h.db, strategy, model, filePath)
+}
+
+// RegisterStrategiesWithConfigFile 使用同一个 JSON 配置文件批量注册多个分表策略。
+func (h *ShardingHelper) RegisterStrategiesWithConfigFile(filePath string, registrations []ConfigFileShardingRegistration) error {
+	for _, item := range registrations {
+		if item.Strategy != nil {
+			h.strategies[item.Strategy.GetBaseTableName()] = item.Strategy
+		}
+	}
+
+	if err := RegisterShardingsWithConfigFile(h.db, filePath, registrations); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // GetStrategy 获取分表策略
@@ -46,7 +75,7 @@ func (h *ShardingHelper) Create(value interface{}) error {
 			return h.db.Table(tableName).Create(value).Error
 		}
 	}
-	
+
 	return fmt.Errorf("no matching sharding strategy found")
 }
 
@@ -56,7 +85,7 @@ func (h *ShardingHelper) CreateWithTable(baseTableName string, value interface{}
 	if !ok {
 		return fmt.Errorf("strategy not found for table: %s", baseTableName)
 	}
-	
+
 	tableName := GetTableNameWithValue(strategy, value)
 	return h.db.Table(tableName).Create(value).Error
 }
@@ -67,14 +96,14 @@ func (h *ShardingHelper) Find(baseTableName string, shardingValue interface{}, d
 	if !ok {
 		return fmt.Errorf("strategy not found for table: %s", baseTableName)
 	}
-	
+
 	tableName := strategy.GetTableName(baseTableName, shardingValue)
 	query := h.db.Table(tableName)
-	
+
 	if len(conds) > 0 {
 		query = query.Where(conds[0], conds[1:]...)
 	}
-	
+
 	return query.Find(dest).Error
 }
 
@@ -84,7 +113,7 @@ func (h *ShardingHelper) FindAll(baseTableName string, dest interface{}, queryBu
 	if !ok {
 		return fmt.Errorf("strategy not found for table: %s", baseTableName)
 	}
-	
+
 	return CrossTableQuery(h.db, strategy, dest, queryBuilder)
 }
 
@@ -94,7 +123,7 @@ func (h *ShardingHelper) Paginate(baseTableName string, dest interface{}, page, 
 	if !ok {
 		return nil, fmt.Errorf("strategy not found for table: %s", baseTableName)
 	}
-	
+
 	return CrossTablePaginate(h.db, strategy, dest, page, pageSize, queryBuilder)
 }
 
@@ -102,13 +131,13 @@ func (h *ShardingHelper) Paginate(baseTableName string, dest interface{}, page, 
 func GenerateTableNames(baseTableName string, strategy ShardingStrategy, tableSQL string) []string {
 	tableNames := strategy.GetAllTableNames(baseTableName)
 	sqlStatements := make([]string, 0, len(tableNames))
-	
+
 	for _, tableName := range tableNames {
 		// 替换表名
 		sql := strings.ReplaceAll(tableSQL, baseTableName, tableName)
 		sqlStatements = append(sqlStatements, sql)
 	}
-	
+
 	return sqlStatements
 }
 
@@ -118,15 +147,15 @@ func GenerateTimeTableNames(baseTableName string, strategy ShardingStrategy, tab
 	if !ok {
 		return []string{}
 	}
-	
+
 	tableNames := timeStrategy.GetAllTableNamesInRange(baseTableName, startTime, endTime)
 	sqlStatements := make([]string, 0, len(tableNames))
-	
+
 	for _, tableName := range tableNames {
 		sql := strings.ReplaceAll(tableSQL, baseTableName, tableName)
 		sqlStatements = append(sqlStatements, sql)
 	}
-	
+
 	return sqlStatements
 }
 
@@ -134,7 +163,7 @@ func GenerateTimeTableNames(baseTableName string, strategy ShardingStrategy, tab
 func CreateAllHashTables(db *gorm.DB, baseTableName string, tableCount int, createTableSQL string) error {
 	hashStrategy := NewHashShardingStrategy(baseTableName, "", tableCount)
 	tableNames := hashStrategy.GetAllTableNames(baseTableName)
-	
+
 	for _, tableName := range tableNames {
 		sql := strings.ReplaceAll(createTableSQL, baseTableName, tableName)
 		if err := db.Exec(sql).Error; err != nil {
@@ -144,7 +173,6 @@ func CreateAllHashTables(db *gorm.DB, baseTableName string, tableCount int, crea
 			}
 		}
 	}
-	
+
 	return nil
 }
-

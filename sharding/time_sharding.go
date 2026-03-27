@@ -1,8 +1,10 @@
 package sharding
 
 import (
+	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,6 +30,34 @@ const (
 	TimeFieldTypeDate                             // string 日期格式 (YYYY-MM-DD)
 	TimeFieldTypeDateTime                         // string 日期时间格式 (YYYY-MM-DD HH:MM:SS)
 )
+
+// GetTimeShardingUnitName 获取时间分表单位的标准名称。
+func GetTimeShardingUnitName(unit TimeShardingUnit) string {
+	switch unit {
+	case TimeShardingByYear:
+		return "year"
+	case TimeShardingByMonth:
+		return "month"
+	case TimeShardingByDay:
+		return "day"
+	case TimeShardingByHour:
+		return "hour"
+	case TimeShardingByMinute:
+		return "minute"
+	default:
+		return ""
+	}
+}
+
+// IsValidTimeShardingUnitName 判断时间分表单位名称是否合法。
+func IsValidTimeShardingUnitName(unitName string) bool {
+	switch strings.ToLower(strings.TrimSpace(unitName)) {
+	case "year", "month", "day", "hour", "minute":
+		return true
+	default:
+		return false
+	}
+}
 
 // TimeShardingStrategy 基于时间的分表策略
 type TimeShardingStrategy struct {
@@ -111,6 +141,38 @@ func (s *TimeShardingStrategy) GetAllTableNamesInRange(baseTableName string, sta
 	}
 
 	return result
+}
+
+// ParseTableTime 从时间分表名中解析出该分片对应的起始时间。
+// 例如：logs_202601 -> 2026-01-01 00:00:00。
+func (s *TimeShardingStrategy) ParseTableTime(tableName string) (time.Time, error) {
+	return s.parseTableTimeInLocation(tableName, time.Local)
+}
+
+// GetTableTimeRange 获取某个时间分表覆盖的时间范围。
+// 返回值中的 endTime 为该分片的结束边界（开区间）。
+func (s *TimeShardingStrategy) GetTableTimeRange(tableName string) (startTime, endTime time.Time, err error) {
+	startTime, err = s.ParseTableTime(tableName)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	return startTime, s.nextShardTime(startTime), nil
+}
+
+// IsTableExpired 判断分表是否已过期。
+// 当分表覆盖区间的结束时间小于等于 expireBefore 时，视为可清理。
+func (s *TimeShardingStrategy) IsTableExpired(tableName string, expireBefore time.Time) (bool, error) {
+	if expireBefore.IsZero() {
+		return false, fmt.Errorf("expireBefore is required")
+	}
+
+	_, endTime, err := s.getTableTimeRangeInLocation(tableName, expireBefore.Location())
+	if err != nil {
+		return false, err
+	}
+
+	return !endTime.After(expireBefore), nil
 }
 
 // GetShardingValue 从模型对象中提取时间字段值
@@ -343,6 +405,16 @@ func (s *TimeShardingStrategy) GetBaseTableName() string {
 	return s.baseTableName
 }
 
+// GetUnit 获取时间分表单位。
+func (s *TimeShardingStrategy) GetUnit() TimeShardingUnit {
+	return s.unit
+}
+
+// GetUnitName 获取时间分表单位名称（year/month/day/hour/minute）。
+func (s *TimeShardingStrategy) GetUnitName() string {
+	return GetTimeShardingUnitName(s.unit)
+}
+
 // getTimeFormat 根据分表单位获取时间格式
 func (s *TimeShardingStrategy) getTimeFormat(unit TimeShardingUnit) string {
 	switch unit {
@@ -358,6 +430,115 @@ func (s *TimeShardingStrategy) getTimeFormat(unit TimeShardingUnit) string {
 		return "200601021504"
 	default:
 		return "200601"
+	}
+}
+
+func (s *TimeShardingStrategy) getTimeSuffixLength() int {
+	switch s.unit {
+	case TimeShardingByYear:
+		return len("2006")
+	case TimeShardingByMonth:
+		return len("200601")
+	case TimeShardingByDay:
+		return len("20060102")
+	case TimeShardingByHour:
+		return len("2006010215")
+	case TimeShardingByMinute:
+		return len("200601021504")
+	default:
+		return len("200601")
+	}
+}
+
+func (s *TimeShardingStrategy) parseTableTimeInLocation(tableName string, loc *time.Location) (time.Time, error) {
+	prefix := s.baseTableName + "_"
+	if !strings.HasPrefix(tableName, prefix) {
+		return time.Time{}, fmt.Errorf("table %s does not belong to base table %s", tableName, s.baseTableName)
+	}
+
+	suffix := strings.TrimPrefix(tableName, prefix)
+	if len(suffix) != s.getTimeSuffixLength() {
+		return time.Time{}, fmt.Errorf("table %s does not match time suffix format %s", tableName, s.timeFormat)
+	}
+
+	if loc == nil {
+		loc = time.Local
+	}
+
+	parsedTime, err := time.ParseInLocation(s.timeFormat, suffix, loc)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse time suffix %q for table %s: %w", suffix, tableName, err)
+	}
+
+	return parsedTime, nil
+}
+
+func (s *TimeShardingStrategy) getTableTimeRangeInLocation(tableName string, loc *time.Location) (startTime, endTime time.Time, err error) {
+	startTime, err = s.parseTableTimeInLocation(tableName, loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	return startTime, s.nextShardTime(startTime), nil
+}
+
+func (s *TimeShardingStrategy) nextShardTime(currentTime time.Time) time.Time {
+	switch s.unit {
+	case TimeShardingByYear:
+		return currentTime.AddDate(1, 0, 0)
+	case TimeShardingByMonth:
+		return currentTime.AddDate(0, 1, 0)
+	case TimeShardingByDay:
+		return currentTime.AddDate(0, 0, 1)
+	case TimeShardingByHour:
+		return currentTime.Add(time.Hour)
+	case TimeShardingByMinute:
+		return currentTime.Add(time.Minute)
+	default:
+		return currentTime.AddDate(0, 1, 0)
+	}
+}
+
+func (s *TimeShardingStrategy) alignToShardStart(currentTime time.Time) time.Time {
+	loc := currentTime.Location()
+	if loc == nil {
+		loc = time.Local
+	}
+
+	switch s.unit {
+	case TimeShardingByYear:
+		return time.Date(currentTime.Year(), time.January, 1, 0, 0, 0, 0, loc)
+	case TimeShardingByMonth:
+		return time.Date(currentTime.Year(), currentTime.Month(), 1, 0, 0, 0, 0, loc)
+	case TimeShardingByDay:
+		return time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, loc)
+	case TimeShardingByHour:
+		return time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), currentTime.Hour(), 0, 0, 0, loc)
+	case TimeShardingByMinute:
+		return time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), currentTime.Hour(), currentTime.Minute(), 0, 0, loc)
+	default:
+		return time.Date(currentTime.Year(), currentTime.Month(), 1, 0, 0, 0, 0, loc)
+	}
+}
+
+func (s *TimeShardingStrategy) shiftShardTime(currentTime time.Time, offset int) time.Time {
+	if offset == 0 {
+		return currentTime
+	}
+
+	switch s.unit {
+	case TimeShardingByYear:
+		return currentTime.AddDate(offset, 0, 0)
+	case TimeShardingByMonth:
+		return currentTime.AddDate(0, offset, 0)
+	case TimeShardingByDay:
+		return currentTime.AddDate(0, 0, offset)
+	case TimeShardingByHour:
+		return currentTime.Add(time.Duration(offset) * time.Hour)
+	case TimeShardingByMinute:
+		return currentTime.Add(time.Duration(offset) * time.Minute)
+	default:
+		return currentTime.AddDate(0, offset, 0)
 	}
 }
 

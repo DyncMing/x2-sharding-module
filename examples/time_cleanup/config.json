@@ -1,0 +1,32 @@
+{
+  "autoCreateTable": true,
+  "timeSharding": {
+    "autoCleanupPolicies": {
+      "default": {
+        "enabled": true,
+        "retainCount": 1,
+        "minInterval": "1h"
+      },
+      "byUnit": {
+        "day": {
+          "enabled": true,
+          "retainCount": 7,
+          "minInterval": "30m"
+        },
+        "hour": {
+          "enabled": true,
+          "retainCount": 24,
+          "minInterval": "15m"
+        }
+      },
+      "byBaseTable": {
+        "logs": {
+          "enabled": true,
+          "retainCount": 3,
+          "minInterval": "0s"
+        }
+      }
+    }
+  }
+}
+

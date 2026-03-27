@@ -2,15 +2,25 @@ package sharding
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
 )
 
+var autoCleanupRunState = struct {
+	mu      sync.Mutex
+	lastRun map[string]time.Time
+}{
+	lastRun: make(map[string]time.Time),
+}
+
 // AutoMigrateOptions 自动迁移选项
 type AutoMigrateOptions struct {
-	SkipIfExists bool             // 如果表已存在则跳过
+	SkipIfExists bool                  // 如果表已存在则跳过
 	TimeRange    *AutoMigrateTimeRange // 时间分表的时间范围（可选）
 }
 
@@ -18,6 +28,28 @@ type AutoMigrateOptions struct {
 type AutoMigrateTimeRange struct {
 	StartTime time.Time
 	EndTime   time.Time
+}
+
+type cleanupExpiredTimeTablesOptions struct {
+	ExpireBefore time.Time // 分表结束边界 <= 该时间时视为过期
+	DryRun       bool      // 仅预览，不实际删除表
+}
+
+// CleanupRetainRecentTimeTablesOptions 按保留最近 N 个时间分片清理旧表的选项。
+type CleanupRetainRecentTimeTablesOptions struct {
+	RetainCount   int       // 保留最近 N 个分片（包含 ReferenceTime 所在分片）
+	ReferenceTime time.Time // 参考时间；零值时默认使用 time.Now()
+	DryRun        bool      // 仅预览，不实际删除表
+}
+
+// CleanupExpiredTimeTablesResult 清理过期时间分表的结果。
+type CleanupExpiredTimeTablesResult struct {
+	ScannedCount  int
+	MatchedTables []string
+	SkippedTables []string
+	ExpiredTables []string
+	DroppedTables []string
+	DryRun        bool
 }
 
 // AutoMigrate 自动创建所有分表（基于 GORM AutoMigrate）
@@ -53,7 +85,7 @@ func AutoMigrate(db *gorm.DB, strategy ShardingStrategy, model interface{}, opti
 // AutoMigrateTimeSharding 自动创建时间分表
 func AutoMigrateTimeSharding(db *gorm.DB, strategy *TimeShardingStrategy, model interface{}, options ...AutoMigrateOptions) error {
 	baseTableName := strategy.GetBaseTableName()
-	
+
 	var timeRange *AutoMigrateTimeRange
 	skipIfExists := false
 
@@ -85,6 +117,141 @@ func AutoMigrateTimeSharding(db *gorm.DB, strategy *TimeShardingStrategy, model 
 	return nil
 }
 
+// cleanupExpiredTimeTables 扫描数据库中属于当前时间分表策略的实际分表，并清理已过期的表。
+// 过期判定规则：分表覆盖区间的结束时间 <= ExpireBefore。
+func cleanupExpiredTimeTables(db *gorm.DB, strategy *TimeShardingStrategy, options cleanupExpiredTimeTablesOptions) (*CleanupExpiredTimeTablesResult, error) {
+	if db == nil {
+		return nil, fmt.Errorf("db is required")
+	}
+	if strategy == nil {
+		return nil, fmt.Errorf("time sharding strategy is required")
+	}
+	if options.ExpireBefore.IsZero() {
+		return nil, fmt.Errorf("ExpireBefore is required")
+	}
+
+	tableNames, err := db.Migrator().GetTables()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tables: %w", err)
+	}
+	sort.Strings(tableNames)
+
+	result := &CleanupExpiredTimeTablesResult{
+		ScannedCount:  len(tableNames),
+		MatchedTables: make([]string, 0),
+		SkippedTables: make([]string, 0),
+		ExpiredTables: make([]string, 0),
+		DroppedTables: make([]string, 0),
+		DryRun:        options.DryRun,
+	}
+
+	prefix := strategy.GetBaseTableName() + "_"
+	for _, tableName := range tableNames {
+		if !strings.HasPrefix(tableName, prefix) {
+			continue
+		}
+
+		expired, err := strategy.IsTableExpired(tableName, options.ExpireBefore)
+		if err != nil {
+			result.SkippedTables = append(result.SkippedTables, tableName)
+			continue
+		}
+
+		result.MatchedTables = append(result.MatchedTables, tableName)
+		if !expired {
+			continue
+		}
+
+		result.ExpiredTables = append(result.ExpiredTables, tableName)
+		if options.DryRun {
+			continue
+		}
+
+		if err := db.Migrator().DropTable(tableName); err != nil {
+			return result, fmt.Errorf("failed to drop expired table %s: %w", tableName, err)
+		}
+		result.DroppedTables = append(result.DroppedTables, tableName)
+	}
+
+	return result, nil
+}
+
+// CleanupTimeTablesRetainingRecent 按保留最近 N 个时间分片的方式清理旧表。
+// retainCount 包含 ReferenceTime 所在分片；例如按月分表时，referenceTime=2026-03-27、retainCount=3，
+// 则保留 2026-01、2026-02、2026-03 对应的分表。
+func CleanupTimeTablesRetainingRecent(db *gorm.DB, strategy *TimeShardingStrategy, options CleanupRetainRecentTimeTablesOptions) (*CleanupExpiredTimeTablesResult, error) {
+	if strategy == nil {
+		return nil, fmt.Errorf("time sharding strategy is required")
+	}
+	if options.RetainCount <= 0 {
+		return nil, fmt.Errorf("RetainCount must be greater than 0")
+	}
+
+	referenceTime := options.ReferenceTime
+	if referenceTime.IsZero() {
+		referenceTime = time.Now()
+	}
+
+	currentShardStart := strategy.alignToShardStart(referenceTime)
+	earliestRetainedShardStart := strategy.shiftShardTime(currentShardStart, -(options.RetainCount - 1))
+
+	return cleanupExpiredTimeTables(db, strategy, cleanupExpiredTimeTablesOptions{
+		ExpireBefore: earliestRetainedShardStart,
+		DryRun:       options.DryRun,
+	})
+}
+
+func maybeAutoCleanupTimeTables(db *gorm.DB, strategy *TimeShardingStrategy, shardingValue interface{}, options *TimeShardingRegisterOptions) error {
+	if db == nil || strategy == nil || options == nil || options.AutoCleanup == nil || !options.AutoCleanup.Enabled {
+		return nil
+	}
+
+	referenceTime := strategy.convertToTime(shardingValue)
+	if referenceTime.IsZero() {
+		referenceTime = time.Now()
+	}
+
+	cleanupKey := getAutoCleanupStateKey(db, strategy)
+	now := time.Now()
+
+	autoCleanupRunState.mu.Lock()
+	lastRun, ok := autoCleanupRunState.lastRun[cleanupKey]
+	if ok && options.AutoCleanup.MinInterval > 0 && now.Sub(lastRun) < options.AutoCleanup.MinInterval {
+		autoCleanupRunState.mu.Unlock()
+		return nil
+	}
+	autoCleanupRunState.lastRun[cleanupKey] = now
+	autoCleanupRunState.mu.Unlock()
+
+	_, err := CleanupTimeTablesRetainingRecent(db, strategy, CleanupRetainRecentTimeTablesOptions{
+		RetainCount:   options.AutoCleanup.RetainCount,
+		ReferenceTime: referenceTime,
+	})
+	if err != nil {
+		autoCleanupRunState.mu.Lock()
+		delete(autoCleanupRunState.lastRun, cleanupKey)
+		autoCleanupRunState.mu.Unlock()
+		return err
+	}
+
+	return nil
+}
+
+func getAutoCleanupStateKey(db *gorm.DB, strategy *TimeShardingStrategy) string {
+	baseTableName := strategy.GetBaseTableName()
+	unitName := strategy.GetUnitName()
+	if db == nil || db.ConnPool == nil {
+		return fmt.Sprintf("%s:%s", baseTableName, unitName)
+	}
+
+	connValue := reflect.ValueOf(db.ConnPool)
+	if connValue.IsValid() && connValue.Kind() == reflect.Ptr && !connValue.IsNil() {
+		return fmt.Sprintf("%x:%s:%s", connValue.Pointer(), baseTableName, unitName)
+	}
+
+	return fmt.Sprintf("%T:%s:%s", db.ConnPool, baseTableName, unitName)
+}
+
 // migrateTable 迁移单个表
 func migrateTable(db *gorm.DB, tableName string, model interface{}, skipIfExists bool) error {
 	// 检查表是否存在
@@ -100,15 +267,12 @@ func migrateTable(db *gorm.DB, tableName string, model interface{}, skipIfExists
 
 // tableExists 检查表是否存在
 func tableExists(db *gorm.DB, tableName string) bool {
-	var exists bool
-	query := "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?)"
-	err := db.Raw(query, tableName).Scan(&exists).Error
-	return err == nil && exists
+	return db != nil && db.Migrator().HasTable(tableName)
 }
 
 // AutoCreateTable 自动创建分表（如果不存在）
 // 在插入数据时调用，如果表不存在则自动创建
-func AutoCreateTable(db *gorm.DB, strategy ShardingStrategy, tableName string, model interface{}) error {
+func AutoCreateTable(db *gorm.DB, _ ShardingStrategy, tableName string, model interface{}) error {
 	if tableExists(db, tableName) {
 		return nil // 表已存在
 	}
@@ -176,16 +340,16 @@ func extractTableDefinition(sql string) string {
 	// 简化处理：如果 SQL 中已经包含 CREATE TABLE IF NOT EXISTS，直接返回
 	sql = strings.TrimSpace(sql)
 	upperSQL := strings.ToUpper(sql)
-	
+
 	if strings.Contains(upperSQL, "CREATE TABLE IF NOT EXISTS") {
 		return sql
 	}
-	
+
 	// 替换 CREATE TABLE 为 CREATE TABLE IF NOT EXISTS
 	if strings.HasPrefix(upperSQL, "CREATE TABLE") {
 		sql = strings.Replace(sql, "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
 	}
-	
+
 	return sql
 }
 
@@ -202,4 +366,3 @@ func EnsureTableExists(db *gorm.DB, strategy ShardingStrategy, shardingValue int
 	// 创建表
 	return db.Table(tableName).AutoMigrate(model)
 }
-

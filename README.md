@@ -15,6 +15,7 @@
 - ✅ **多表连接查询** - 支持 3 个及以上分表的连接查询
 - ✅ **GORM 插件机制** - 无缝集成 GORM，无需修改现有代码
 - ✅ **自动创建分表** - 支持自动创建所有分表，插入数据时自动创建表
+- ✅ **过期分表清理** - 支持按时间分表策略识别并清理过期表，支持 DryRun 预览
 - ✅ **辅助工具** - 提供便捷的辅助函数和批量操作工具
 
 ## 快速开始
@@ -51,8 +52,11 @@ func main() {
     
     // 插入数据（自动路由到对应分表）
     user := &User{UserID: 123, Name: "John"}
-    tableName := hashStrategy.GetTableName("users", 123)
-    db.Table(tableName).Create(user)
+    _ = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
+    db.Create(user)
+
+    // 或使用显式封装：按策略写入，并自动建表
+    _ = sharding.CreateShardedWithAutoCreate(db, hashStrategy, user, &User{})
     
     // 跨表查询
     var users []User
@@ -93,6 +97,42 @@ dateStrategy := sharding.NewTimeShardingStrategyWithType(
 startTimestamp := time.Now().AddDate(0, -1, 0).Unix()
 endTime := time.Now()
 tableNames := timeStrategy.GetAllTableNamesInRangeWithValues("logs", startTimestamp, endTime)
+
+// 清理旧分表：可通过同一个配置文件为多个时间分表策略分别开启自动清理
+now := time.Now()
+_ = sharding.RegisterShardingWithConfigFile(
+    db,
+    timeStrategy,
+    &Log{},
+    "examples/time_cleanup/config.json",
+)
+
+// 正常写入时会自动建表，并根据配置清理过期分表
+_ = db.Create(&Log{CreatedAt: now, Message: "hello"}).Error
+
+// config.json 示例：
+// {
+//   "autoCreateTable": true,
+//   "timeSharding": {
+//     "autoCleanupPolicies": {
+//       "default": {"enabled": true, "retainCount": 1, "minInterval": "1h"},
+//       "byUnit": {
+//         "day": {"enabled": true, "retainCount": 7, "minInterval": "30m"},
+//         "hour": {"enabled": true, "retainCount": 24, "minInterval": "15m"}
+//       },
+//       "byBaseTable": {
+//         "logs": {"enabled": true, "retainCount": 3, "minInterval": "0s"}
+//       }
+//     }
+//   }
+// }
+
+// 你可以对 logs / metrics / traces / audits 等多个时间分表策略重复使用同一个配置文件；
+// 系统会按优先级自动选择策略：byBaseTable > byUnit > default。
+// 如果要一次性注册多个策略，可使用 RegisterShardingsWithConfigFile(...)
+// 参考完整示例：examples/time_cleanup_multi/
+
+// 如需手工执行一次清理，也可以继续使用 CleanupTimeTablesRetainingRecent
 ```
 
 #### 跨表分页
@@ -291,8 +331,13 @@ x2-sharding-module/
 │   ├── internal/models/      # 示例共享模型
 │   ├── hash_sharding/main.go
 │   ├── time_sharding/main.go
+│   ├── time_cleanup/main.go
+│   ├── time_cleanup/config.json
+│   ├── time_cleanup_multi/main.go
+│   ├── time_cleanup_multi/config.json
 │   ├── join/main.go
-│   └── multi_join/main.go
+│   ├── multi_join/main.go
+│   └── examples/README.md
 ├── go.mod
 ├── README.md
 └── USAGE.md          # 详细使用文档
@@ -322,6 +367,13 @@ x2-sharding-module/
 ### 自动创建分表
 
 - `AutoMigrate(db, strategy, model, options)` - 自动创建所有分表
+- `AutoMigrateTimeSharding(db, strategy, model, options)` - 按时间范围自动创建时间分表
+- `RegisterShardingWithOptions(db, strategy, options)` - 使用统一选项注册分表策略
+- `RegisterShardingWithConfigFile(db, strategy, model, filePath)` - 使用 JSON 配置文件注册分表策略
+- `RegisterShardingsWithConfigFile(db, filePath, registrations)` - 使用同一个 JSON 配置文件批量注册多个分表策略
+- `LoadRegisterShardingOptionsFromJSON(filePath, model)` - 从 JSON 配置文件加载通用注册选项
+- `LoadRegisterShardingOptionsForStrategyFromJSON(filePath, strategy, model)` - 按当前策略解析共享 JSON 配置文件中的自动清理策略（支持 `default` / `byUnit` / `byBaseTable`）
+- `CleanupTimeTablesRetainingRecent(db, strategy, options)` - 按保留最近 N 个时间分片清理旧表
 
 ### 连接查询与分页
 
@@ -339,6 +391,8 @@ x2-sharding-module/
 - `CrossTableMultiJoinCountWithTimeRange(...)` - 多表时间分表连接计数
 - `CrossTableMultiJoinPaginateOptimized(...)` - 基于连接键的多表优化连接分页
 - `RegisterShardingWithAutoCreate(db, strategy, model)` - 注册策略并启用自动创建
+- `CreateSharded(db, strategy, value)` - 显式按分表策略写入记录
+- `CreateShardedWithAutoCreate(db, strategy, value, model)` - 显式按分表策略写入并自动建表
 - `EnsureTableExists(db, strategy, shardingValue, model)` - 确保表存在
 - `AutoMigrateAll(db, strategies, models, options)` - 批量自动创建所有策略的分表
 

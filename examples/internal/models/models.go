@@ -25,6 +25,27 @@ type Log struct {
 	Level     string    `gorm:"column:level"`
 }
 
+// Metric 适用于按天分表的指标示例。
+type Metric struct {
+	ID        uint      `gorm:"primarykey;column:id"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+	Message   string    `gorm:"column:message"`
+}
+
+// Trace 适用于按小时分表的链路追踪示例。
+type Trace struct {
+	ID        uint      `gorm:"primarykey;column:id"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+	Message   string    `gorm:"column:message"`
+}
+
+// AuditLog 适用于按年分表的审计日志示例。
+type AuditLog struct {
+	ID        uint      `gorm:"primarykey;column:id"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+	Message   string    `gorm:"column:message"`
+}
+
 // Event 适用于按 created_at 分表的事件表示例。
 type Event struct {
 	ID        uint      `gorm:"primarykey;column:id"`

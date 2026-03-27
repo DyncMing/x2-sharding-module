@@ -16,6 +16,8 @@ root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Loca
 ```bash
 go run ./examples/hash_sharding
 go run ./examples/time_sharding
+go run ./examples/time_cleanup
+go run ./examples/time_cleanup_multi
 go run ./examples/join
 go run ./examples/join_pagination
 go run ./examples/multi_join_pagination
@@ -49,6 +51,18 @@ go run ./examples/multi_join_pagination
 
 - `time_sharding/main.go`  
   演示按时间分表、时间范围内表名推导、跨表分页。
+
+- `time_cleanup/main.go`  
+  演示通过 `config.json` 启用时间分表自动建表与自动清理，正常写入时自动触发。
+
+- `time_cleanup/config.json`  
+  时间分表自动清理配置示例，支持通过同一个文件为多个时间分表策略按 `baseTable` / `unit` 配置不同的保留数量和清理间隔。
+
+- `time_cleanup_multi/main.go`  
+  演示 `month/day/hour/year` 多个时间分表策略通过同一个配置文件批量注册，并在写入时各自按不同策略自动清理。
+
+- `time_cleanup_multi/config.json`  
+  多时间分表策略共享配置文件示例，展示 `default / byUnit / byBaseTable` 三层优先级。
 
 - `time_types/main.go`  
   演示 `time.Time`、秒级时间戳、毫秒时间戳、日期字符串等多种时间字段类型。

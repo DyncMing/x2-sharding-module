@@ -86,14 +86,7 @@ func main() {
 
 	tableName := hashStrategy.GetTableName("users", 123)
 	fmt.Printf("User will be inserted into table: %s\n", tableName)
-
-	// 确保表存在
-	err = sharding.EnsureTableExists(db, hashStrategy, 123, &models.UserWithEmail{})
-	if err != nil {
-		log.Printf("Ensure table exists error: %v\n", err)
-	}
-
-	err = db.Table(tableName).Create(user).Error
+	err = db.Create(user).Error
 	if err != nil {
 		log.Printf("Create user error: %v\n", err)
 	} else {
@@ -116,18 +109,24 @@ func main() {
 
 	tableName = timeStrategy.GetTableName("logs", log1.CreatedAt)
 	fmt.Printf("Log will be inserted into table: %s\n", tableName)
-
-	// 确保表存在
-	err = sharding.EnsureTableExists(db, timeStrategy, log1.CreatedAt, &models.Log{})
-	if err != nil {
-		log.Printf("Ensure table exists error: %v\n", err)
-	}
-
-	err = db.Table(tableName).Create(log1).Error
+	err = db.Create(log1).Error
 	if err != nil {
 		log.Printf("Create log error: %v\n", err)
 	} else {
 		fmt.Println("Log created successfully!")
+	}
+
+	fmt.Println("\n=== 示例 4.1: 使用显式封装按分表写入并自动建表 ===")
+	log2 := &models.Log{
+		CreatedAt: time.Now().AddDate(0, 1, 0),
+		Message:   "Explicit sharded create",
+		Level:     "WARN",
+	}
+	err = sharding.CreateShardedWithAutoCreate(db, timeStrategy, log2, &models.Log{})
+	if err != nil {
+		log.Printf("CreateShardedWithAutoCreate error: %v\n", err)
+	} else {
+		fmt.Printf("Explicit sharded create succeeded for table: %s\n", timeStrategy.GetTableName("logs", log2.CreatedAt))
 	}
 
 	fmt.Println("\n=== 示例 5: 批量创建多个策略的分表 ===")

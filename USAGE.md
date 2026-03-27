@@ -112,9 +112,136 @@ err := sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
 
 // 插入数据时，如果表不存在会自动创建
 user := &User{UserID: 123, Name: "John"}
-tableName := hashStrategy.GetTableName("users", 123)
-db.Table(tableName).Create(user) // 如果表不存在会自动创建
+db.Create(user) // 会自动路由到实际分表，并在目标表不存在时自动创建
 ```
+
+说明：
+
+- `RegisterShardingWithAutoCreate` 的推荐用法是直接 `db.Create(&model)`；
+- 如果你调用了 `db.Table(...)`，也建议传入注册时的 `model`，这样插件可以按模型类型识别并改写到真实分表；
+- 如果你不想依赖回调，也可以直接使用显式封装 `CreateShardedWithAutoCreate(...)`。
+
+```go
+// 显式按分表策略写入，并自动建表
+err = sharding.CreateShardedWithAutoCreate(db, hashStrategy, user, &User{})
+```
+
+#### 方式 2.1: 通过配置启用时间分表自动清理
+
+如果你希望“正常写入时，自动根据当前时间分表策略清理过期表”，推荐把自动建表和自动清理统一放到注册配置里：
+
+```go
+options := sharding.RegisterShardingOptions{
+    Model:           &Log{},
+    AutoCreateTable: true,
+    TimeSharding: &sharding.TimeShardingRegisterOptions{
+        AutoCleanup: &sharding.TimeShardingAutoCleanupOptions{
+            Enabled:     true,
+            RetainCount: 3,          // 保留当前分片在内最近 3 个分片
+            MinInterval: time.Hour,  // 至少间隔 1 小时才再次执行清理
+        },
+    },
+}
+
+err := sharding.RegisterShardingWithOptions(db, timeStrategy, options)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 后续正常写入时，会自动建表，并按当前时间分片触发懒清理
+err = db.Create(&Log{
+    CreatedAt: time.Now(),
+    Message:   "auto cleanup on write",
+}).Error
+```
+
+如果你更偏好配置文件，也可以直接使用 JSON：
+
+```json
+{
+  "autoCreateTable": true,
+  "timeSharding": {
+    "autoCleanupPolicies": {
+      "default": {
+        "enabled": true,
+        "retainCount": 1,
+        "minInterval": "1h"
+      },
+      "byUnit": {
+        "day": {
+          "enabled": true,
+          "retainCount": 7,
+          "minInterval": "30m"
+        },
+        "hour": {
+          "enabled": true,
+          "retainCount": 24,
+          "minInterval": "15m"
+        }
+      },
+      "byBaseTable": {
+        "logs": {
+          "enabled": true,
+          "retainCount": 3,
+          "minInterval": "0s"
+        },
+        "audit_logs": {
+          "enabled": true,
+          "retainCount": 2,
+          "minInterval": "24h"
+        }
+      }
+    }
+  }
+}
+```
+
+```go
+err := sharding.RegisterShardingWithConfigFile(
+    db,
+    timeStrategy,
+    &Log{},
+    "examples/time_cleanup/config.json",
+)
+```
+
+如果系统启动时需要一次性注册多个时间分表策略，也可以批量方式：
+
+```go
+err := sharding.RegisterShardingsWithConfigFile(
+    db,
+    "examples/time_cleanup_multi/config.json",
+    []sharding.ConfigFileShardingRegistration{
+        {Strategy: logsStrategy, Model: &Log{}},
+        {Strategy: metricsStrategy, Model: &Metric{}},
+        {Strategy: tracesStrategy, Model: &Trace{}},
+        {Strategy: auditStrategy, Model: &AuditLog{}},
+    },
+)
+```
+
+完整可运行示例可参考：`examples/time_cleanup_multi/`
+
+同一个配置文件可以被多个时间分表策略复用，例如：
+
+- `logs` 按月分表，保留最近 3 个分片；
+- `metrics` 按日分表，按 `byUnit.day` 保留最近 7 个分片；
+- `traces` 按小时分表，按 `byUnit.hour` 保留最近 24 个分片；
+- `audit_logs` 按年分表，按 `byBaseTable.audit_logs` 保留最近 2 个分片；
+- 其他未单独声明的时间分表策略，则回退到 `default`。
+
+优先级固定为：
+
+1. `byBaseTable`
+2. `byUnit`
+3. `default`
+
+说明：
+
+- 自动清理只对 `TimeShardingStrategy` 生效；
+- `RetainCount` 包含当前写入记录所在的时间分片；
+- `MinInterval` 用于避免每次写入都做一次清理；
+- 清理会根据当前时间分表策略自动推导范围，无需业务方再手工调用清理方法。
 
 #### 方式 3: 手动确保表存在
 
@@ -125,6 +252,52 @@ if err == nil {
     db.Table(tableName).Create(user)
 }
 ```
+
+#### 方式 4: 手工按保留最近 N 个时间分片清理旧表（高级）
+
+如果你不想依赖“写入时自动清理”，也可以使用唯一保留的高级手工入口：
+
+- `CleanupTimeTablesRetainingRecent(...)` 适用于任意时间分片单位；
+- `RetainCount` 包含 `ReferenceTime` 所在当前分片；
+- `ReferenceTime` 传零值时默认使用 `time.Now()`；
+- `DryRun` 可先预览，再正式删除。
+
+```go
+timeStrategy := sharding.NewTimeShardingStrategy("logs", "CreatedAt", sharding.TimeShardingByMonth)
+
+preview, err := sharding.CleanupTimeTablesRetainingRecent(db, timeStrategy, sharding.CleanupRetainRecentTimeTablesOptions{
+    RetainCount:   3,
+    ReferenceTime: time.Now(),
+    DryRun:        true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("Would drop: %v\n", preview.ExpiredTables)
+
+result, err := sharding.CleanupTimeTablesRetainingRecent(db, timeStrategy, sharding.CleanupRetainRecentTimeTablesOptions{
+    RetainCount:   3,
+    ReferenceTime: time.Now(),
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("Dropped: %v\n", result.DroppedTables)
+```
+
+以按月分表为例：当 `ReferenceTime = 2026-03-27` 且 `RetainCount = 3` 时，保留的是：
+
+- `logs_202601`
+- `logs_202602`
+- `logs_202603`
+
+更早的月表会被识别为可清理对象。
+
+说明：内部仍然基于时间分片边界计算实际清理范围，因此月/日/年分表都能正确处理。
+
+因此当 `ExpireBefore = 2026-03-01 00:00:00` 时，`logs_202601` 和 `logs_202602` 都会被视为已过期。
 
 ### 1. Hash 分表
 
@@ -312,6 +485,25 @@ for _, tableName := range tableNames {
     var logs []Log
     db.Table(tableName).Where("level = ?", "INFO").Find(&logs)
 }
+```
+
+#### 解析分表时间与判断是否过期
+
+```go
+startTime, endTime, err := timeStrategy.GetTableTimeRange("logs_202602")
+if err != nil {
+    log.Fatal(err)
+}
+
+expired, err := timeStrategy.IsTableExpired(
+    "logs_202602",
+    time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("range=[%s, %s), expired=%v\n", startTime, endTime, expired)
 ```
 
 #### 跨表查询
@@ -835,7 +1027,12 @@ A: Hash 分表扩展需要迁移数据。建议在初期设计时就预留足够
 
 ### Q: 时间分表如何清理旧数据？
 
-A: 可以直接删除对应的分表：`DROP TABLE logs_202301;`
+A: 推荐两种方式：
+
+- **推荐**：在 `RegisterShardingWithOptions(...)` 或 `RegisterShardingWithConfigFile(...)` 中开启时间分表自动清理，让系统在正常写入时按当前策略自动清理；
+- **高级手工方式**：使用 `CleanupTimeTablesRetainingRecent(...)` 按“保留最近 N 个时间分片”的规则执行一次清理。
+
+除非你非常确定当前表就是待删除的历史分表，否则不建议业务侧直接手写 `DROP TABLE ...`。
 
 ### Q: 跨表查询性能如何优化？
 
