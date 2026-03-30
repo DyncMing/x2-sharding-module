@@ -14,7 +14,7 @@
 - ✅ **跨表连接查询** - 支持两个分表之间的 JOIN 操作
 - ✅ **多表连接查询** - 支持 3 个及以上分表的连接查询
 - ✅ **GORM 插件机制** - 无缝集成 GORM，无需修改现有代码
-- ✅ **自动创建分表** - 支持自动创建所有分表，插入数据时自动创建表
+- ✅ **自动创建 / 自动更新分表结构** - 支持自动创建所有分表，插入数据时自动创建表，并可同步已存在分表的新增字段
 - ✅ **过期分表清理** - 支持按时间分表策略识别并清理过期表，支持 DryRun 预览
 - ✅ **辅助工具** - 提供便捷的辅助函数和批量操作工具
 
@@ -55,7 +55,7 @@ func main() {
     _ = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
     db.Create(user)
 
-    // 或使用显式封装：按策略写入，并自动建表
+    // 或使用显式封装：按策略写入，并自动建表 / 同步已存在分表结构
     _ = sharding.CreateShardedWithAutoCreate(db, hashStrategy, user, &User{})
     
     // 跨表查询
@@ -65,6 +65,16 @@ func main() {
     })
 }
 ```
+
+> **Hash 分表结构升级提示**
+>
+> 如果历史 Hash 分表已经存在，而模型后来新增了字段（例如新增 `email` 列），可以直接选下面任一方式：
+>
+> - 保持原有 `db.Create(...)` 写法：`RegisterShardingWithAutoCreate(db, hashStrategy, &User{})`
+> - 单次写入前显式补齐目标分表结构：`CreateShardedWithSchemaSync(...)`
+> - 一次性批量升级历史 Hash 分表：`AutoMigrateExistingTables(...)`
+>
+> 完整可运行示例：`examples/hash_schema_sync/`
 
 #### 时间分表
 
@@ -98,7 +108,7 @@ startTimestamp := time.Now().AddDate(0, -1, 0).Unix()
 endTime := time.Now()
 tableNames := timeStrategy.GetAllTableNamesInRangeWithValues("logs", startTimestamp, endTime)
 
-// 清理旧分表：可通过同一个配置文件为多个时间分表策略分别开启自动清理
+// 清理旧分表 / 自动同步已存在分表结构：可通过同一个配置文件统一启用
 now := time.Now()
 _ = sharding.RegisterShardingWithConfigFile(
     db,
@@ -107,12 +117,13 @@ _ = sharding.RegisterShardingWithConfigFile(
     "examples/time_cleanup/config.json",
 )
 
-// 正常写入时会自动建表，并根据配置清理过期分表
+// 正常写入时会自动建表、同步已存在分表结构，并根据配置清理过期分表
 _ = db.Create(&Log{CreatedAt: now, Message: "hello"}).Error
 
 // config.json 示例：
 // {
 //   "autoCreateTable": true,
+//   "autoUpdateSchema": true,
 //   "timeSharding": {
 //     "autoCleanupPolicies": {
 //       "default": {"enabled": true, "retainCount": 1, "minInterval": "1h"},
@@ -134,6 +145,59 @@ _ = db.Create(&Log{CreatedAt: now, Message: "hello"}).Error
 
 // 如需手工执行一次清理，也可以继续使用 CleanupTimeTablesRetainingRecent
 ```
+
+#### 已存在分表结构自动更新
+
+```go
+// Hash 分表：假设 users_3 已经存在，但还是旧结构（例如没有 email 字段）
+type LegacyUser struct {
+    ID     uint   `gorm:"primarykey;column:id"`
+    UserID int64  `gorm:"column:user_id;not null"`
+    Name   string `gorm:"column:name"`
+}
+
+userID := int64(123)
+legacyHashTable := hashStrategy.GetTableName("users", userID)
+_ = db.Table(legacyHashTable).AutoMigrate(&LegacyUser{})
+
+// 方式 1：单次写入前，自动同步目标 Hash 分表结构
+_ = sharding.CreateShardedWithSchemaSync(db, hashStrategy, &User{
+    UserID: userID,
+    Name:   "Alice",
+    Email:  "alice@example.com",
+}, &User{})
+
+// 方式 2：使用 RegisterShardingWithAutoCreate 后，正常 db.Create(...) 命中已有分表时也会自动同步
+_ = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
+_ = db.Create(&User{UserID: 124, Name: "Bob", Email: "bob@example.com"}).Error
+
+// 方式 3：批量同步数据库中所有已存在的该 Hash 分表结构
+_ = sharding.AutoMigrateExistingTables(db, hashStrategy, &User{})
+
+// Time 分表同样支持：
+type LegacyLog struct {
+    ID        uint      `gorm:"primarykey;column:id"`
+    CreatedAt time.Time `gorm:"column:created_at;not null"`
+    Message   string    `gorm:"column:message"`
+}
+
+targetTime := time.Date(2027, 3, 15, 10, 0, 0, 0, time.UTC)
+legacyTimeTable := timeStrategy.GetTableName("logs", targetTime)
+_ = db.Table(legacyTimeTable).AutoMigrate(&LegacyLog{})
+
+_ = sharding.CreateShardedWithSchemaSync(db, timeStrategy, &Log{
+    CreatedAt: targetTime,
+    Message:   "schema evolved",
+    Level:     "INFO",
+}, &Log{})
+
+_ = sharding.AutoMigrateExistingTables(db, timeStrategy, &Log{})
+```
+
+说明：当前增强主要面向 **新增字段/新增列** 这类 GORM `AutoMigrate` 可安全处理的结构演进。
+字段删除、字段重命名、复杂索引差异等高风险 DDL，仍建议由业务方显式执行迁移脚本。
+
+完整可运行示例：`examples/hash_schema_sync/`、`examples/auto_migrate/`
 
 #### 跨表分页
 
@@ -330,6 +394,7 @@ x2-sharding-module/
 ├── examples/          # 示例代码
 │   ├── internal/models/      # 示例共享模型
 │   ├── hash_sharding/main.go
+│   ├── hash_schema_sync/main.go
 │   ├── time_sharding/main.go
 │   ├── time_cleanup/main.go
 │   ├── time_cleanup/config.json
@@ -368,6 +433,7 @@ x2-sharding-module/
 
 - `AutoMigrate(db, strategy, model, options)` - 自动创建所有分表
 - `AutoMigrateTimeSharding(db, strategy, model, options)` - 按时间范围自动创建时间分表
+- `AutoMigrateExistingTables(db, strategy, model)` - 批量同步数据库中已存在的分表结构
 - `RegisterShardingWithOptions(db, strategy, options)` - 使用统一选项注册分表策略
 - `RegisterShardingWithConfigFile(db, strategy, model, filePath)` - 使用 JSON 配置文件注册分表策略
 - `RegisterShardingsWithConfigFile(db, filePath, registrations)` - 使用同一个 JSON 配置文件批量注册多个分表策略
@@ -390,10 +456,12 @@ x2-sharding-module/
 - `CrossTableMultiJoinPaginateWithTimeRange(...)` - 多表时间分表连接分页
 - `CrossTableMultiJoinCountWithTimeRange(...)` - 多表时间分表连接计数
 - `CrossTableMultiJoinPaginateOptimized(...)` - 基于连接键的多表优化连接分页
-- `RegisterShardingWithAutoCreate(db, strategy, model)` - 注册策略并启用自动创建
+- `RegisterShardingWithAutoCreate(db, strategy, model)` - 注册策略并启用自动创建；目标分表已存在时自动同步表结构
 - `CreateSharded(db, strategy, value)` - 显式按分表策略写入记录
-- `CreateShardedWithAutoCreate(db, strategy, value, model)` - 显式按分表策略写入并自动建表
+- `CreateShardedWithAutoCreate(db, strategy, value, model)` - 显式按分表策略写入，并自动建表 / 同步已存在分表结构
+- `CreateShardedWithSchemaSync(db, strategy, value, model)` - 显式按分表策略写入，并确保目标分表结构与当前模型同步
 - `EnsureTableExists(db, strategy, shardingValue, model)` - 确保表存在
+- `EnsureTableSchema(db, strategy, shardingValue, model)` - 确保分表存在，并同步已存在分表结构
 - `AutoMigrateAll(db, strategies, models, options)` - 批量自动创建所有策略的分表
 
 ### 查询操作

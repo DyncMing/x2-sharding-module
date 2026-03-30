@@ -14,7 +14,9 @@ root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Loca
 运行示例时，请在仓库根目录执行：
 
 ```bash
+go run ./examples/auto_migrate
 go run ./examples/hash_sharding
+go run ./examples/hash_schema_sync
 go run ./examples/time_sharding
 go run ./examples/time_cleanup
 go run ./examples/time_cleanup_multi
@@ -26,7 +28,7 @@ go run ./examples/multi_join_pagination
 ## 示例索引
 
 - `auto_migrate/main.go`  
-  演示自动创建 Hash / Time / Range / Modulo 分表，以及按需建表。
+  演示自动创建 Hash / Time / Range / Modulo 分表、按需建表，以及已存在分表的表结构自动同步。
 
 - `custom_sharding/main.go`  
   演示自定义分表函数、按类别分表、复杂表名生成逻辑。
@@ -36,6 +38,9 @@ go run ./examples/multi_join_pagination
 
 - `hash_sharding/main.go`  
   演示基于 Hash 的分表、跨表查询和分页。
+
+- `hash_schema_sync/main.go`  
+  演示 Hash 分表在“历史分表已存在、模型新增字段”场景下，如何使用 `CreateShardedWithSchemaSync`、`RegisterShardingWithAutoCreate` 和 `AutoMigrateExistingTables` 自动补齐表结构。
 
 - `join/main.go`  
   演示两个分表的连接查询，以及跨分表 JOIN。

@@ -28,18 +28,20 @@ type ShardingStrategy interface {
 
 // ShardingConfig 分表配置
 type ShardingConfig struct {
-	Strategy        ShardingStrategy
-	BaseDB          *gorm.DB
-	TableNames      map[string]string // 缓存表名映射
-	AutoCreateTable bool              // 是否自动创建表
-	Model           interface{}       // 用于自动创建表的模型
+	Strategy         ShardingStrategy
+	BaseDB           *gorm.DB
+	TableNames       map[string]string // 缓存表名映射
+	AutoCreateTable  bool              // 是否自动创建表
+	AutoUpdateSchema bool              // 是否自动更新已存在分表的表结构
+	Model            interface{}       // 用于自动创建表的模型
 }
 
 // RegisterShardingOptions 注册分表策略时的运行时选项。
 type RegisterShardingOptions struct {
-	Model           interface{}
-	AutoCreateTable bool
-	TimeSharding    *TimeShardingRegisterOptions
+	Model            interface{}
+	AutoCreateTable  bool
+	AutoUpdateSchema bool
+	TimeSharding     *TimeShardingRegisterOptions
 }
 
 // TimeShardingRegisterOptions 时间分表注册选项。
@@ -56,8 +58,9 @@ type TimeShardingAutoCleanupOptions struct {
 
 // RegisterShardingFileConfig JSON 配置文件对应的注册选项。
 type RegisterShardingFileConfig struct {
-	AutoCreateTable bool                            `json:"autoCreateTable"`
-	TimeSharding    *TimeShardingRegisterFileConfig `json:"timeSharding,omitempty"`
+	AutoCreateTable  bool                            `json:"autoCreateTable"`
+	AutoUpdateSchema bool                            `json:"autoUpdateSchema,omitempty"`
+	TimeSharding     *TimeShardingRegisterFileConfig `json:"timeSharding,omitempty"`
 }
 
 // TimeShardingRegisterFileConfig JSON 配置文件中的时间分表注册选项。
@@ -95,8 +98,9 @@ func RegisterSharding(db *gorm.DB, strategy ShardingStrategy) error {
 // RegisterShardingWithAutoCreate 注册分表策略并启用自动创建表功能
 func RegisterShardingWithAutoCreate(db *gorm.DB, strategy ShardingStrategy, model interface{}) error {
 	return RegisterShardingWithOptions(db, strategy, RegisterShardingOptions{
-		Model:           model,
-		AutoCreateTable: true,
+		Model:            model,
+		AutoCreateTable:  true,
+		AutoUpdateSchema: true,
 	})
 }
 
@@ -139,13 +143,19 @@ func RegisterShardingWithOptions(db *gorm.DB, strategy ShardingStrategy, options
 		tx.Statement.TableExpr = nil
 
 		baseDB := tx.Session(&gorm.Session{NewDB: true})
-		if options.AutoCreateTable {
+		if options.AutoCreateTable || options.AutoUpdateSchema {
 			tableModel := options.Model
 			if tableModel == nil {
 				tableModel = tx.Statement.Dest
 			}
 
-			if err := AutoCreateTable(baseDB, strategy, tableName, tableModel); err != nil {
+			var err error
+			if options.AutoUpdateSchema {
+				err = AutoCreateTableWithSchemaSync(baseDB, strategy, tableName, tableModel)
+			} else {
+				err = AutoCreateTable(baseDB, strategy, tableName, tableModel)
+			}
+			if err != nil {
 				tx.AddError(err)
 				return
 			}
@@ -181,8 +191,9 @@ func loadRegisterShardingOptionsFromJSON(filePath string, strategy ShardingStrat
 	}
 
 	options := RegisterShardingOptions{
-		Model:           model,
-		AutoCreateTable: fileConfig.AutoCreateTable,
+		Model:            model,
+		AutoCreateTable:  fileConfig.AutoCreateTable,
+		AutoUpdateSchema: fileConfig.AutoUpdateSchema,
 	}
 	if fileConfig.TimeSharding != nil {
 		autoCleanupConfig := fileConfig.TimeSharding.AutoCleanup
@@ -318,12 +329,17 @@ func SetTableName(db *gorm.DB, strategy ShardingStrategy, value interface{}) {
 
 // CreateSharded 显式按分表策略创建记录。
 func CreateSharded(db *gorm.DB, strategy ShardingStrategy, value interface{}) error {
-	return createShardedRecord(db, strategy, value, nil, false)
+	return createShardedRecord(db, strategy, value, nil, false, false)
 }
 
-// CreateShardedWithAutoCreate 显式按分表策略创建记录，并在目标表不存在时自动建表。
+// CreateShardedWithAutoCreate 显式按分表策略创建记录；目标表不存在时自动建表，已存在时自动同步表结构。
 func CreateShardedWithAutoCreate(db *gorm.DB, strategy ShardingStrategy, value interface{}, model interface{}) error {
-	return createShardedRecord(db, strategy, value, model, true)
+	return createShardedRecord(db, strategy, value, model, true, true)
+}
+
+// CreateShardedWithSchemaSync 显式按分表策略创建记录，并确保目标分表结构与当前模型同步。
+func CreateShardedWithSchemaSync(db *gorm.DB, strategy ShardingStrategy, value interface{}, model interface{}) error {
+	return createShardedRecord(db, strategy, value, model, false, true)
 }
 
 // ExtractValue 从 interface{} 中提取值（支持结构体字段）
@@ -408,7 +424,7 @@ func FormatTimeTableName(baseTableName string, t time.Time, format string) strin
 	return fmt.Sprintf("%s_%s", baseTableName, t.Format(format))
 }
 
-func createShardedRecord(db *gorm.DB, strategy ShardingStrategy, value interface{}, model interface{}, autoCreate bool) error {
+func createShardedRecord(db *gorm.DB, strategy ShardingStrategy, value interface{}, model interface{}, autoCreate bool, autoUpdateSchema bool) error {
 	if db == nil {
 		return fmt.Errorf("db is required")
 	}
@@ -422,12 +438,19 @@ func createShardedRecord(db *gorm.DB, strategy ShardingStrategy, value interface
 	}
 
 	tableName := strategy.GetTableName(strategy.GetBaseTableName(), shardingValue)
-	if autoCreate {
+	if autoCreate || autoUpdateSchema {
 		tableModel := model
 		if tableModel == nil {
 			tableModel = value
 		}
-		if err := AutoCreateTable(db.Session(&gorm.Session{NewDB: true}), strategy, tableName, tableModel); err != nil {
+
+		var err error
+		if autoUpdateSchema {
+			err = AutoCreateTableWithSchemaSync(db.Session(&gorm.Session{NewDB: true}), strategy, tableName, tableModel)
+		} else {
+			err = AutoCreateTable(db.Session(&gorm.Session{NewDB: true}), strategy, tableName, tableModel)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -488,6 +511,10 @@ func indirectModelType(value interface{}) reflect.Type {
 }
 
 func validateRegisterShardingOptions(strategy ShardingStrategy, options RegisterShardingOptions) error {
+	if (options.AutoCreateTable || options.AutoUpdateSchema) && options.Model == nil {
+		return fmt.Errorf("model is required when AutoCreateTable or AutoUpdateSchema is enabled")
+	}
+
 	if options.TimeSharding == nil || options.TimeSharding.AutoCleanup == nil || !options.TimeSharding.AutoCleanup.Enabled {
 		return nil
 	}

@@ -12,6 +12,12 @@ import (
 	"gorm.io/gorm"
 )
 
+type legacyExampleLog struct {
+	ID        uint      `gorm:"primarykey;column:id"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+	Message   string    `gorm:"column:message"`
+}
+
 func main() {
 	// 连接数据库
 	dsn := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
@@ -127,6 +133,36 @@ func main() {
 		log.Printf("CreateShardedWithAutoCreate error: %v\n", err)
 	} else {
 		fmt.Printf("Explicit sharded create succeeded for table: %s\n", timeStrategy.GetTableName("logs", log2.CreatedAt))
+	}
+
+	fmt.Println("\n=== 示例 4.2: 已存在分表自动同步表结构 ===")
+	legacyTime := time.Now().AddDate(1, 0, 0)
+	legacyTableName := timeStrategy.GetTableName("logs", legacyTime)
+	err = db.Table(legacyTableName).AutoMigrate(&legacyExampleLog{})
+	if err != nil {
+		log.Printf("Prepare legacy table error: %v\n", err)
+	} else {
+		fmt.Printf("Prepared legacy shard without level column: %s\n", legacyTableName)
+	}
+
+	log3 := &models.Log{
+		CreatedAt: legacyTime,
+		Message:   "Schema sync on existing shard",
+		Level:     "DEBUG",
+	}
+	err = sharding.CreateShardedWithSchemaSync(db, timeStrategy, log3, &models.Log{})
+	if err != nil {
+		log.Printf("CreateShardedWithSchemaSync error: %v\n", err)
+	} else {
+		fmt.Printf("Existing shard schema synced before insert: %s\n", legacyTableName)
+	}
+
+	fmt.Println("\n=== 示例 4.3: 批量同步数据库中已存在的分表结构 ===")
+	err = sharding.AutoMigrateExistingTables(db, timeStrategy, &models.Log{})
+	if err != nil {
+		log.Printf("AutoMigrateExistingTables error: %v\n", err)
+	} else {
+		fmt.Println("All existing time-sharded tables have been schema-synced successfully!")
 	}
 
 	fmt.Println("\n=== 示例 5: 批量创建多个策略的分表 ===")

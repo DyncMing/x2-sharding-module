@@ -110,7 +110,7 @@ err = sharding.AutoMigrate(db, timeStrategy, &Log{}, sharding.AutoMigrateOptions
 // 注册策略并启用自动创建表功能
 err := sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
 
-// 插入数据时，如果表不存在会自动创建
+// 插入数据时，如果表不存在会自动创建；如果表已存在，则会自动同步新增字段
 user := &User{UserID: 123, Name: "John"}
 db.Create(user) // 会自动路由到实际分表，并在目标表不存在时自动创建
 ```
@@ -118,6 +118,7 @@ db.Create(user) // 会自动路由到实际分表，并在目标表不存在时�
 说明：
 
 - `RegisterShardingWithAutoCreate` 的推荐用法是直接 `db.Create(&model)`；
+- `RegisterShardingWithAutoCreate` 现在默认也会在目标分表“已存在”时执行一次懒 `AutoMigrate`，适合模型新增字段后的平滑升级；
 - 如果你调用了 `db.Table(...)`，也建议传入注册时的 `model`，这样插件可以按模型类型识别并改写到真实分表；
 - 如果你不想依赖回调，也可以直接使用显式封装 `CreateShardedWithAutoCreate(...)`。
 
@@ -126,14 +127,65 @@ db.Create(user) // 会自动路由到实际分表，并在目标表不存在时�
 err = sharding.CreateShardedWithAutoCreate(db, hashStrategy, user, &User{})
 ```
 
+#### 方式 2.0: 已存在分表自动同步表结构
+
+如果你的分表已经存在，而模型后来新增了字段，推荐按下面顺序选择：
+
+1. **单次写入前补齐目标分表**：`CreateShardedWithSchemaSync(...)`
+2. **沿用原有 `db.Create(...)` 写法**：`RegisterShardingWithAutoCreate(...)`
+3. **批量升级历史分表**：`AutoMigrateExistingTables(...)`
+
+下面以 Hash 分表为例：
+
+```go
+type LegacyUser struct {
+    ID     uint   `gorm:"primarykey;column:id"`
+    UserID int64  `gorm:"column:user_id;not null"`
+    Name   string `gorm:"column:name"`
+}
+
+type User struct {
+    ID     uint   `gorm:"primarykey;column:id"`
+    UserID int64  `gorm:"column:user_id;not null"`
+    Name   string `gorm:"column:name"`
+    Email  string `gorm:"column:email"`
+}
+
+tableName := hashStrategy.GetTableName("users", int64(123))
+_ = db.Table(tableName).AutoMigrate(&LegacyUser{}) // 模拟旧结构分表
+
+// 方式 1：单次写入前，确保目标分表结构与当前模型同步
+err = sharding.CreateShardedWithSchemaSync(db, hashStrategy, &User{
+    UserID: 123,
+    Name:   "John",
+    Email:  "john@example.com",
+}, &User{})
+
+// 方式 2：批量同步数据库中“已存在”的该策略所有分表
+err = sharding.AutoMigrateExistingTables(db, hashStrategy, &User{})
+```
+
+如果你仍希望保持最少改造，也可以直接：
+
+```go
+err = sharding.RegisterShardingWithAutoCreate(db, hashStrategy, &User{})
+err = db.Create(&User{UserID: 124, Name: "Bob", Email: "bob@example.com"}).Error
+```
+
+完整可运行示例：`examples/hash_schema_sync/`
+
+说明：当前能力主要覆盖 GORM `AutoMigrate` 可安全处理的结构演进，尤其是**新增字段 / 新增列**。
+对于删除列、重命名列、复杂索引变更等高风险 DDL，仍建议使用显式迁移脚本。
+
 #### 方式 2.1: 通过配置启用时间分表自动清理
 
-如果你希望“正常写入时，自动根据当前时间分表策略清理过期表”，推荐把自动建表和自动清理统一放到注册配置里：
+如果你希望“正常写入时，自动根据当前时间分表策略清理过期表”，推荐把自动建表、自动更新分表结构和自动清理统一放到注册配置里：
 
 ```go
 options := sharding.RegisterShardingOptions{
     Model:           &Log{},
     AutoCreateTable: true,
+    AutoUpdateSchema: true,
     TimeSharding: &sharding.TimeShardingRegisterOptions{
         AutoCleanup: &sharding.TimeShardingAutoCleanupOptions{
             Enabled:     true,
@@ -148,7 +200,7 @@ if err != nil {
     log.Fatal(err)
 }
 
-// 后续正常写入时，会自动建表，并按当前时间分片触发懒清理
+// 后续正常写入时，会自动建表 / 同步分表结构，并按当前时间分片触发懒清理
 err = db.Create(&Log{
     CreatedAt: time.Now(),
     Message:   "auto cleanup on write",
@@ -160,6 +212,7 @@ err = db.Create(&Log{
 ```json
 {
   "autoCreateTable": true,
+  "autoUpdateSchema": true,
   "timeSharding": {
     "autoCleanupPolicies": {
       "default": {
@@ -241,6 +294,7 @@ err := sharding.RegisterShardingsWithConfigFile(
 - 自动清理只对 `TimeShardingStrategy` 生效；
 - `RetainCount` 包含当前写入记录所在的时间分片；
 - `MinInterval` 用于避免每次写入都做一次清理；
+- `autoUpdateSchema` 开启后，命中已有时间分表时也会自动同步新增字段；
 - 清理会根据当前时间分表策略自动推导范围，无需业务方再手工调用清理方法。
 
 #### 方式 3: 手动确保表存在
@@ -251,6 +305,12 @@ err := sharding.EnsureTableExists(db, hashStrategy, 123, &User{})
 if err == nil {
     db.Table(tableName).Create(user)
 }
+```
+
+如果你希望“表存在即可，但同时把结构补齐到当前模型”，可以使用：
+
+```go
+err := sharding.EnsureTableSchema(db, hashStrategy, 123, &User{})
 ```
 
 #### 方式 4: 手工按保留最近 N 个时间分片清理旧表（高级）
@@ -1033,6 +1093,16 @@ A: 推荐两种方式：
 - **高级手工方式**：使用 `CleanupTimeTablesRetainingRecent(...)` 按“保留最近 N 个时间分片”的规则执行一次清理。
 
 除非你非常确定当前表就是待删除的历史分表，否则不建议业务侧直接手写 `DROP TABLE ...`。
+
+### Q: 如果分表结构发生变化（例如新增字段），会自动更新已存在的分表吗？
+
+A: 现在支持，推荐按下面三种方式选择：
+
+- **最省事**：使用 `RegisterShardingWithAutoCreate(...)`，后续 `db.Create(...)` 命中已有分表时会自动同步结构；
+- **显式单表同步**：使用 `CreateShardedWithSchemaSync(...)` 或 `EnsureTableSchema(...)`；
+- **批量同步历史分表**：使用 `AutoMigrateExistingTables(...)`。
+
+当前实现主要适合新增列这类 `AutoMigrate` 安全支持的变更；删除列、重命名列、复杂索引调整等，仍建议通过正式迁移脚本处理。
 
 ### Q: 跨表查询性能如何优化？
 

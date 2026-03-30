@@ -18,6 +18,13 @@ var autoCleanupRunState = struct {
 	lastRun: make(map[string]time.Time),
 }
 
+var autoSchemaSyncState = struct {
+	mu     sync.Mutex
+	synced map[string]struct{}
+}{
+	synced: make(map[string]struct{}),
+}
+
 // AutoMigrateOptions 自动迁移选项
 type AutoMigrateOptions struct {
 	SkipIfExists bool                  // 如果表已存在则跳过
@@ -237,6 +244,42 @@ func maybeAutoCleanupTimeTables(db *gorm.DB, strategy *TimeShardingStrategy, sha
 	return nil
 }
 
+func maybeAutoUpdateShardSchema(db *gorm.DB, tableName string, model interface{}, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+
+	return autoMigrateTableOnce(db, tableName, model)
+}
+
+func autoMigrateTableOnce(db *gorm.DB, tableName string, model interface{}) error {
+	if db == nil {
+		return fmt.Errorf("db is required")
+	}
+	if model == nil {
+		return fmt.Errorf("model is required")
+	}
+
+	stateKey := getAutoSchemaSyncStateKey(db, tableName, model)
+
+	autoSchemaSyncState.mu.Lock()
+	_, alreadySynced := autoSchemaSyncState.synced[stateKey]
+	autoSchemaSyncState.mu.Unlock()
+	if alreadySynced {
+		return nil
+	}
+
+	if err := db.Table(tableName).AutoMigrate(model); err != nil {
+		return err
+	}
+
+	autoSchemaSyncState.mu.Lock()
+	autoSchemaSyncState.synced[stateKey] = struct{}{}
+	autoSchemaSyncState.mu.Unlock()
+
+	return nil
+}
+
 func getAutoCleanupStateKey(db *gorm.DB, strategy *TimeShardingStrategy) string {
 	baseTableName := strategy.GetBaseTableName()
 	unitName := strategy.GetUnitName()
@@ -250,6 +293,67 @@ func getAutoCleanupStateKey(db *gorm.DB, strategy *TimeShardingStrategy) string 
 	}
 
 	return fmt.Sprintf("%T:%s:%s", db.ConnPool, baseTableName, unitName)
+}
+
+func getAutoSchemaSyncStateKey(db *gorm.DB, tableName string, model interface{}) string {
+	modelType := indirectModelType(model)
+	modelKey := "<nil>"
+	if modelType != nil {
+		modelKey = modelType.PkgPath() + "." + modelType.String()
+	}
+
+	if db == nil || db.ConnPool == nil {
+		return fmt.Sprintf("%s:%s", tableName, modelKey)
+	}
+
+	connValue := reflect.ValueOf(db.ConnPool)
+	if connValue.IsValid() && connValue.Kind() == reflect.Ptr && !connValue.IsNil() {
+		return fmt.Sprintf("%x:%s:%s", connValue.Pointer(), tableName, modelKey)
+	}
+
+	return fmt.Sprintf("%T:%s:%s", db.ConnPool, tableName, modelKey)
+}
+
+func getExistingShardTableNames(db *gorm.DB, strategy ShardingStrategy) ([]string, error) {
+	if db == nil {
+		return nil, fmt.Errorf("db is required")
+	}
+	if strategy == nil {
+		return nil, fmt.Errorf("strategy is required")
+	}
+
+	baseTableName := strategy.GetBaseTableName()
+	if timeStrategy, ok := strategy.(*TimeShardingStrategy); ok {
+		allTables, err := db.Migrator().GetTables()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list tables: %w", err)
+		}
+
+		prefix := baseTableName + "_"
+		matched := make([]string, 0)
+		for _, tableName := range allTables {
+			if !strings.HasPrefix(tableName, prefix) {
+				continue
+			}
+			if _, err := timeStrategy.ParseTableTime(tableName); err != nil {
+				continue
+			}
+			matched = append(matched, tableName)
+		}
+
+		sort.Strings(matched)
+		return matched, nil
+	}
+
+	tableNames := strategy.GetAllTableNames(baseTableName)
+	matched := make([]string, 0, len(tableNames))
+	for _, tableName := range tableNames {
+		if tableExists(db, tableName) {
+			matched = append(matched, tableName)
+		}
+	}
+
+	return matched, nil
 }
 
 // migrateTable 迁移单个表
@@ -270,6 +374,27 @@ func tableExists(db *gorm.DB, tableName string) bool {
 	return db != nil && db.Migrator().HasTable(tableName)
 }
 
+// AutoMigrateExistingTables 自动同步数据库中已经存在的分表结构。
+//
+// 适用场景：模型新增字段后，希望对“已经存在的实际分表”统一执行一次 GORM AutoMigrate。
+//
+// - Hash/Range/Modulo 等固定分表：基于策略已知的表名集合，筛选出实际存在的表后执行迁移；
+// - Time 分表：扫描数据库中符合当前基础表名前缀且能被当前时间策略解析的实际分表后执行迁移。
+func AutoMigrateExistingTables(db *gorm.DB, strategy ShardingStrategy, model interface{}) error {
+	tableNames, err := getExistingShardTableNames(db, strategy)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		if err := migrateTable(db, tableName, model, false); err != nil {
+			return fmt.Errorf("failed to migrate existing table %s: %w", tableName, err)
+		}
+	}
+
+	return nil
+}
+
 // AutoCreateTable 自动创建分表（如果不存在）
 // 在插入数据时调用，如果表不存在则自动创建
 func AutoCreateTable(db *gorm.DB, _ ShardingStrategy, tableName string, model interface{}) error {
@@ -279,6 +404,25 @@ func AutoCreateTable(db *gorm.DB, _ ShardingStrategy, tableName string, model in
 
 	// 创建表
 	return db.Table(tableName).AutoMigrate(model)
+}
+
+// AutoCreateTableWithSchemaSync 自动创建分表；如果表已存在，则执行一次 AutoMigrate 同步表结构。
+//
+// 为避免在高频写入场景下重复执行 DDL，同一进程内会按“数据库连接 + 表名 + 模型类型”维度做一次轻量缓存。
+func AutoCreateTableWithSchemaSync(db *gorm.DB, _ ShardingStrategy, tableName string, model interface{}) error {
+	if tableExists(db, tableName) {
+		return autoMigrateTableOnce(db, tableName, model)
+	}
+
+	if err := db.Table(tableName).AutoMigrate(model); err != nil {
+		return err
+	}
+
+	autoSchemaSyncState.mu.Lock()
+	autoSchemaSyncState.synced[getAutoSchemaSyncStateKey(db, tableName, model)] = struct{}{}
+	autoSchemaSyncState.mu.Unlock()
+
+	return nil
 }
 
 // AutoMigrateAll 批量自动迁移多个策略
@@ -365,4 +509,15 @@ func EnsureTableExists(db *gorm.DB, strategy ShardingStrategy, shardingValue int
 
 	// 创建表
 	return db.Table(tableName).AutoMigrate(model)
+}
+
+// EnsureTableSchema 确保目标分表存在，并在表已存在时自动同步表结构。
+func EnsureTableSchema(db *gorm.DB, strategy ShardingStrategy, shardingValue interface{}, model interface{}) error {
+	if strategy == nil {
+		return fmt.Errorf("strategy is required")
+	}
+
+	baseTableName := strategy.GetBaseTableName()
+	tableName := strategy.GetTableName(baseTableName, shardingValue)
+	return AutoCreateTableWithSchemaSync(db, strategy, tableName, model)
 }
